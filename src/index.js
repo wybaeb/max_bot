@@ -2,6 +2,7 @@
 
 require('dotenv').config();
 
+const fs = require('node:fs');
 const TelegramBot = require('node-telegram-bot-api');
 const { Bot: MaxBot } = require('@maxhub/max-bot-api');
 
@@ -47,9 +48,12 @@ const requireEnv = (name) => {
   return value;
 };
 
+const trimSlash = (value) => String(value || '').replace(/\/+$/, '');
+
 const config = {
   telegramToken: requireEnv('TELEGRAM_BOT_TOKEN'),
   maxToken: requireEnv('MAX_BOT_TOKEN'),
+  telegramApiBaseUrl: trimSlash(process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org'),
   maxTargetChatId: process.env.MAX_TARGET_CHAT_ID
     ? parseIntEnv('MAX_TARGET_CHAT_ID')
     : undefined,
@@ -57,6 +61,7 @@ const config = {
     ? parseIntEnv('MAX_TARGET_USER_ID')
     : undefined,
   repostDelayMs: parseIntEnv('REPOST_DELAY_MS', 3000),
+  mediaGroupCollectMs: parseIntEnv('MEDIA_GROUP_COLLECT_MS', 1200),
   sourceChatIds: parseIdList(process.env.TELEGRAM_SOURCE_CHAT_IDS || ''),
   includeTelegramFooter: parseBooleanEnv('INCLUDE_TELEGRAM_FOOTER', true),
 };
@@ -68,11 +73,15 @@ if (config.maxTargetChatId && config.maxTargetUserId) {
 if (config.repostDelayMs < 0) {
   throw new Error('REPOST_DELAY_MS must be >= 0');
 }
+if (config.mediaGroupCollectMs < 0) {
+  throw new Error('MEDIA_GROUP_COLLECT_MS must be >= 0');
+}
 
 const telegram = new TelegramBot(config.telegramToken, { polling: true });
 const maxBot = new MaxBot(config.maxToken);
 
 const queue = [];
+const mediaGroupBuffer = new Map();
 let queueBusy = false;
 const target = {
   chatId: config.maxTargetChatId,
@@ -118,7 +127,97 @@ const hasSupportedAttachment = (messageLike) => {
   );
 };
 
-const getRepostSource = (message) => {
+const getMessageCandidates = (message) => {
+  return [message, message.reply_to_message, message.external_reply].filter(Boolean);
+};
+
+const hasValidFileId = (value) => typeof value === 'string' && value.length > 0;
+
+const resolveDocumentKind = (document) => {
+  const mime = typeof document?.mime_type === 'string' ? document.mime_type.toLowerCase() : '';
+  const fileName = typeof document?.file_name === 'string' ? document.file_name.toLowerCase() : '';
+
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+
+  if (fileName.endsWith('.mp4') || fileName.endsWith('.mov') || fileName.endsWith('.mkv') || fileName.endsWith('.webm')) {
+    return 'video';
+  }
+  if (fileName.endsWith('.mp3') || fileName.endsWith('.m4a') || fileName.endsWith('.wav') || fileName.endsWith('.ogg')) {
+    return 'audio';
+  }
+
+  return 'file';
+};
+
+const buildMediaCandidates = (messageLike, label) => {
+  const results = [];
+  if (!messageLike) return results;
+
+  if (Array.isArray(messageLike.photo) && messageLike.photo.length) {
+    for (let i = messageLike.photo.length - 1; i >= 0; i -= 1) {
+      const photo = messageLike.photo[i];
+      if (!hasValidFileId(photo?.file_id)) continue;
+      results.push({
+        label,
+        kind: 'image',
+        fileId: photo.file_id,
+      });
+    }
+  }
+
+  if (hasValidFileId(messageLike.video?.file_id)) {
+    results.push({
+      label,
+      kind: 'video',
+      fileId: messageLike.video.file_id,
+    });
+  }
+
+  if (hasValidFileId(messageLike.animation?.file_id)) {
+    results.push({
+      label,
+      kind: 'video',
+      fileId: messageLike.animation.file_id,
+    });
+  }
+
+  if (hasValidFileId(messageLike.audio?.file_id)) {
+    results.push({
+      label,
+      kind: 'audio',
+      fileId: messageLike.audio.file_id,
+    });
+  }
+
+  if (hasValidFileId(messageLike.voice?.file_id)) {
+    results.push({
+      label,
+      kind: 'audio',
+      fileId: messageLike.voice.file_id,
+    });
+  }
+
+  if (hasValidFileId(messageLike.video_note?.file_id)) {
+    results.push({
+      label,
+      kind: 'video',
+      fileId: messageLike.video_note.file_id,
+    });
+  }
+
+  if (hasValidFileId(messageLike.document?.file_id)) {
+    results.push({
+      label,
+      kind: resolveDocumentKind(messageLike.document),
+      fileId: messageLike.document.file_id,
+    });
+  }
+
+  return results;
+};
+
+const chooseTextSource = (message) => {
   if (hasSupportedAttachment(message)) return message;
   if (hasSupportedAttachment(message.reply_to_message)) return message.reply_to_message;
   if (hasSupportedAttachment(message.external_reply)) return message.external_reply;
@@ -285,7 +384,7 @@ const getLinkCandidate = (message, source) => {
 
 const getTelegramFooter = (message) => {
   if (!config.includeTelegramFooter) return '';
-  const source = getRepostSource(message);
+  const source = chooseTextSource(message);
   const sourceLink = getLinkCandidate(message, source);
   if (!sourceLink) return '';
 
@@ -294,7 +393,7 @@ const getTelegramFooter = (message) => {
 
 const getMessageText = (message, warningText = '') => {
   const own = extractTextAndEntities(message);
-  const repostSource = getRepostSource(message);
+  const repostSource = chooseTextSource(message);
   const repost = repostSource === message ? { text: '', entities: [] } : extractTextAndEntities(repostSource);
   const footer = getTelegramFooter(message);
 
@@ -307,12 +406,37 @@ const getMessageText = (message, warningText = '') => {
   return parts.join('\n\n');
 };
 
-const tgFileUrl = async (fileId) => {
-  const file = await telegram.getFile(fileId);
-  if (!file.file_path) {
+const tgResolveFileLocation = async (fileId) => {
+  const endpoint = `${config.telegramApiBaseUrl}/bot${config.telegramToken}/getFile`;
+  const response = await fetch(`${endpoint}?file_id=${encodeURIComponent(fileId)}`);
+
+  if (!response.ok) {
+    throw new Error(`Telegram getFile HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (!payload.ok) {
+    throw new Error(payload.description || 'Telegram getFile failed');
+  }
+
+  const filePath = payload.result?.file_path;
+  if (!filePath) {
     throw new Error(`Telegram did not return file_path for file_id=${fileId}`);
   }
-  return `https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`;
+
+  // Local Bot API server can return absolute paths in --local mode.
+  if (filePath.startsWith('/') && fs.existsSync(filePath)) {
+    return {
+      type: 'source',
+      value: filePath,
+    };
+  }
+
+  const normalized = filePath.replace(/^\/+/, '');
+  return {
+    type: 'url',
+    value: `${config.telegramApiBaseUrl}/file/bot${config.telegramToken}/${normalized}`,
+  };
 };
 
 const isTooBigTelegramError = (err) => {
@@ -320,93 +444,128 @@ const isTooBigTelegramError = (err) => {
   return /file is too big/i.test(text);
 };
 
-const uploadByUrl = async (source) => {
-  if (source.photo && source.photo.length) {
-    const largest = source.photo[source.photo.length - 1];
-    const imageUrl = await tgFileUrl(largest.file_id);
-    return (await maxBot.api.uploadImage({ url: imageUrl })).toJson();
-  }
+const uploadMediaCandidate = async (candidate) => {
+  const location = await tgResolveFileLocation(candidate.fileId);
+  const input = location.type === 'source'
+    ? { source: location.value }
+    : { url: location.value };
 
-  if (source.video) {
-    const videoUrl = await tgFileUrl(source.video.file_id);
-    return (await maxBot.api.uploadVideo({ url: videoUrl })).toJson();
+  if (candidate.kind === 'image') {
+    return (await maxBot.api.uploadImage(input)).toJson();
   }
-
-  if (source.animation) {
-    const animationUrl = await tgFileUrl(source.animation.file_id);
-    return (await maxBot.api.uploadVideo({ url: animationUrl })).toJson();
+  if (candidate.kind === 'video') {
+    return (await maxBot.api.uploadVideo(input)).toJson();
   }
-
-  if (source.audio) {
-    const audioUrl = await tgFileUrl(source.audio.file_id);
-    return (await maxBot.api.uploadAudio({ url: audioUrl })).toJson();
+  if (candidate.kind === 'audio') {
+    return (await maxBot.api.uploadAudio(input)).toJson();
   }
-
-  if (source.voice) {
-    const voiceUrl = await tgFileUrl(source.voice.file_id);
-    return (await maxBot.api.uploadAudio({ url: voiceUrl })).toJson();
-  }
-
-  if (source.video_note) {
-    const videoNoteUrl = await tgFileUrl(source.video_note.file_id);
-    return (await maxBot.api.uploadVideo({ url: videoNoteUrl })).toJson();
-  }
-
-  if (source.document) {
-    const documentUrl = await tgFileUrl(source.document.file_id);
-    const mime = typeof source.document.mime_type === 'string' ? source.document.mime_type : '';
-    const fileName = typeof source.document.file_name === 'string'
-      ? source.document.file_name.toLowerCase()
-      : '';
-    if (mime.startsWith('video/')) {
-      return (await maxBot.api.uploadVideo({ url: documentUrl })).toJson();
-    }
-    if (mime.startsWith('audio/')) {
-      return (await maxBot.api.uploadAudio({ url: documentUrl })).toJson();
-    }
-    if (fileName.endsWith('.mp4') || fileName.endsWith('.mov') || fileName.endsWith('.mkv') || fileName.endsWith('.webm')) {
-      return (await maxBot.api.uploadVideo({ url: documentUrl })).toJson();
-    }
-    if (fileName.endsWith('.mp3') || fileName.endsWith('.m4a') || fileName.endsWith('.wav') || fileName.endsWith('.ogg')) {
-      return (await maxBot.api.uploadAudio({ url: documentUrl })).toJson();
-    }
-    return (await maxBot.api.uploadFile({ url: documentUrl })).toJson();
-  }
-
-  return null;
+  return (await maxBot.api.uploadFile(input)).toJson();
 };
 
 const buildAttachments = async (message) => {
-  const source = getRepostSource(message);
-  try {
-    const attachment = await uploadByUrl(source);
-    if (!attachment && hasSupportedAttachment(message)) {
-      log('Media present but not uploadable from Telegram payload', {
+  const candidates = getMessageCandidates(message);
+  const mediaCandidates = [
+    ...buildMediaCandidates(candidates[0], 'message'),
+    ...buildMediaCandidates(candidates[1], 'reply_to_message'),
+    ...buildMediaCandidates(candidates[2], 'external_reply'),
+  ];
+
+  if (!mediaCandidates.length) {
+    if (candidates.some((item) => hasSupportedAttachment(item))) {
+      log('Media exists but no downloadable file_id', {
         telegram_chat_id: message.chat.id,
         telegram_message_id: message.message_id,
-        source_keys: Object.keys(source || {}),
+        candidate_flags: candidates.map((item) => ({
+          has_supported_attachment: hasSupportedAttachment(item),
+          has_protected_content: Boolean(item?.has_protected_content),
+          has_video: Boolean(item?.video),
+          has_audio: Boolean(item?.audio),
+          has_document: Boolean(item?.document),
+          has_external_reply: Boolean(item?.external_reply),
+        })),
       });
     }
-    return {
-      attachments: attachment ? [attachment] : [],
-      warningText: '',
-    };
-  } catch (err) {
-    const warningText = isTooBigTelegramError(err)
+    return { attachments: [], warningText: '' };
+  }
+
+  let tooBigErrorSeen = false;
+  let lastError = null;
+
+  try {
+    for (const candidate of mediaCandidates) {
+      try {
+        const attachment = await uploadMediaCandidate(candidate);
+        return {
+          attachments: [attachment],
+          warningText: '',
+        };
+      } catch (err) {
+        lastError = err;
+        if (isTooBigTelegramError(err)) {
+          tooBigErrorSeen = true;
+        }
+        log('Attachment candidate failed', {
+          telegram_chat_id: message.chat.id,
+          telegram_message_id: message.message_id,
+          candidate_label: candidate.label,
+          candidate_kind: candidate.kind,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const warningText = tooBigErrorSeen
       ? 'Вложение из Telegram не скопировано: файл слишком большой для Bot API.'
-      : 'Вложение из Telegram не скопировано: ошибка получения файла.';
+      : 'Вложение из Telegram не скопировано: файл недоступен через Bot API.';
 
     log('Attachment upload failed', {
-      error: err instanceof Error ? err.message : String(err),
+      error: lastError instanceof Error ? lastError.message : String(lastError),
       telegram_chat_id: message.chat.id,
       telegram_message_id: message.message_id,
+      candidates_tried: mediaCandidates.map((item) => ({ label: item.label, kind: item.kind })),
     });
 
     return {
       attachments: [],
       warningText,
     };
+  } catch (err) {
+    log('Attachment upload failed unexpectedly', {
+      error: err instanceof Error ? err.message : String(err),
+      telegram_chat_id: message.chat.id,
+      telegram_message_id: message.message_id,
+    });
+    return {
+      attachments: [],
+      warningText: 'Вложение из Telegram не скопировано: внутренняя ошибка.',
+    };
   }
+};
+
+const collectMediaGroup = (message) => {
+  const key = `${message.chat.id}:${message.media_group_id}`;
+  const existing = mediaGroupBuffer.get(key) || {
+    messages: [],
+    timer: null,
+  };
+
+  if (!existing.messages.some((item) => item.message_id === message.message_id)) {
+    existing.messages.push(message);
+  }
+
+  if (existing.timer) clearTimeout(existing.timer);
+  existing.timer = setTimeout(() => {
+    mediaGroupBuffer.delete(key);
+    const messages = [...existing.messages].sort((a, b) => a.message_id - b.message_id);
+    queue.push({
+      kind: 'media_group',
+      runAt: Date.now() + config.repostDelayMs,
+      messages,
+    });
+    void processQueue();
+  }, config.mediaGroupCollectMs);
+
+  mediaGroupBuffer.set(key, existing);
 };
 
 const sendToMax = async (text, attachments) => {
@@ -448,6 +607,35 @@ const forwardToMax = async (message) => {
   });
 };
 
+const forwardMediaGroupToMax = async (messages) => {
+  const ordered = [...messages].sort((a, b) => a.message_id - b.message_id);
+  const anchor = ordered.find((item) => extractTextAndEntities(item).text) || ordered[0];
+
+  const attachments = [];
+  const warnings = new Set();
+
+  for (const message of ordered) {
+    const built = await buildAttachments(message);
+    if (built.attachments.length) {
+      attachments.push(...built.attachments);
+    }
+    if (built.warningText) {
+      warnings.add(built.warningText);
+    }
+  }
+
+  const warningText = warnings.size ? Array.from(warnings).join('\n') : '';
+  const text = getMessageText(anchor, warningText);
+  await sendToMax(text, attachments);
+
+  log('Reposted media group', {
+    telegram_chat_id: anchor.chat.id,
+    telegram_media_group_id: anchor.media_group_id,
+    telegram_messages: ordered.length,
+    attachments: attachments.length,
+  });
+};
+
 const processQueue = async () => {
   if (queueBusy) return;
   queueBusy = true;
@@ -462,12 +650,16 @@ const processQueue = async () => {
 
       queue.shift();
       try {
-        await forwardToMax(next.message);
+        if (next.kind === 'media_group') {
+          await forwardMediaGroupToMax(next.messages);
+        } else {
+          await forwardToMax(next.message);
+        }
       } catch (err) {
         log('Failed to repost message', {
           error: err instanceof Error ? err.message : String(err),
-          telegram_chat_id: next.message.chat.id,
-          telegram_message_id: next.message.message_id,
+          telegram_chat_id: next.message?.chat?.id || next.messages?.[0]?.chat?.id,
+          telegram_message_id: next.message?.message_id || next.messages?.[0]?.message_id,
         });
       }
     }
@@ -478,6 +670,7 @@ const processQueue = async () => {
 
 const enqueueMessage = (message) => {
   queue.push({
+    kind: 'single',
     message,
     runAt: Date.now() + config.repostDelayMs,
   });
@@ -486,6 +679,10 @@ const enqueueMessage = (message) => {
 
 const onTelegramMessage = (message) => {
   if (!isAllowedSource(message.chat.id)) return;
+  if (message.media_group_id) {
+    collectMediaGroup(message);
+    return;
+  }
   enqueueMessage(message);
 };
 
