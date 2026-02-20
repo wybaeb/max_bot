@@ -4,6 +4,7 @@
   "description": "Bridge bot: repost from Telegram to MAX with delay",
   "main": "src/index.js",
   "scripts": {
+    "bridge": "./bridge.sh",
     "start": "node src/index.js"
   },
   "engines": {

@@ -17,6 +17,19 @@ set +a
 : "${REMOTE_USER:?REMOTE_USER is required in .env}"
 
 APP_DIR="${REMOTE_APP_DIR:-/opt/max_bot}"
+ROUTING_CONFIG_PATH="${ROUTING_CONFIG_PATH:-config/routes.json}"
+LOCAL_ROUTING_PATH="${ROOT_DIR}/${ROUTING_CONFIG_PATH}"
+
+if [[ ! -f "${LOCAL_ROUTING_PATH}" ]]; then
+  echo "Routing config not found (${LOCAL_ROUTING_PATH}), generating via bridge.sh"
+  "${ROOT_DIR}/bridge.sh"
+fi
+
+if [[ ! -f "${LOCAL_ROUTING_PATH}" ]]; then
+  echo "Routing config still missing: ${LOCAL_ROUTING_PATH}"
+  echo "Create it manually or run ./bridge.sh"
+  exit 1
+fi
 
 SSH_ARGS=(-o StrictHostKeyChecking=accept-new)
 SCP_ARGS=(-o StrictHostKeyChecking=accept-new)
@@ -36,14 +49,15 @@ else
 fi
 
 echo "Preparing ${REMOTE_HOST}:${APP_DIR}"
-"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/scripts' '${APP_DIR}/config'"
+REMOTE_ROUTING_DIR="${APP_DIR}/$(dirname "${ROUTING_CONFIG_PATH}")"
+"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/scripts' '${APP_DIR}/config' '${REMOTE_ROUTING_DIR}'"
 
 echo "Uploading files"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package-lock.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package-lock.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/ecosystem.config.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/ecosystem.config.js"
 "${SCP_CMD[@]}" "${ROOT_DIR}/src/index.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/src/index.js"
-"${SCP_CMD[@]}" "${ROOT_DIR}/config/routes.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/config/routes.json"
+"${SCP_CMD[@]}" "${LOCAL_ROUTING_PATH}" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/${ROUTING_CONFIG_PATH}"
 "${SCP_CMD[@]}" "${ROOT_DIR}/.env" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/.env"
 
 echo "Installing dependencies and restarting service"

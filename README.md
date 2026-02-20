@@ -1,95 +1,65 @@
 # Telegram/MAX bridge
 
-Бот маршрутизирует сообщения между сетями по явным правилам из `config/routes.json`.
+Бот маршрутизирует сообщения между сетями по правилам из `config/routes.json`.
 
-## 1) Переменные `.env`
+## Быстрый старт
 
-Заполните:
-
-- `TELEGRAM_BOT_TOKEN`
-- `MAX_BOT_TOKEN`
-- `TELEGRAM_API_BASE_URL` (`https://api.telegram.org` или ваш self-hosted Bot API)
-- `ROUTING_CONFIG_PATH` (обычно `config/routes.json`)
-- `DEFAULT_*` (глобальные дефолты, если не заданы в маршруте)
-
-`REMOTE_*` используются `scripts/deploy.sh`.
-
-## 2) Маршруты
-
-Файл маршрутов: `config/routes.json`.
-
-Пример структуры:
-
-```json
-{
-  "routes": [
-    {
-      "id": "debug_tg_to_max",
-      "enabled": true,
-      "source": {
-        "network": "telegram",
-        "chat_id": -4720219405
-      },
-      "destinations": [
-        {
-          "network": "max",
-          "chat_id": -71276213876121
-        }
-      ],
-      "options": {
-        "repost_delay_ms": 3000,
-        "media_group_collect_ms": 1200,
-        "include_telegram_footer": true
-      }
-    }
-  ]
-}
-```
-
-Поддерживаемые источники:
-
-- `telegram`: `chat_id` и/или `chat_username`
-- `max`: `chat_id`
-
-Поддерживаемые назначения:
-
-- `max`: ровно одно из `chat_id` или `user_id`
-- `telegram`: `chat_id`
-
-## 3) Что уже добавлено
-
-В `config/routes.json` добавлены 2 маршрута:
-
-- `debug_tg_to_max` (включен): Telegram debug -> MAX `Test Channel`
-- `prod_tg_to_max` (выключен): Telegram source (placeholder) -> MAX `Shuvaev`
-
-Для прод-маршрута укажите реальный `source` и включите `"enabled": true`.
-
-## 4) Запуск и деплой
-
-```bash
-npm install
-npm start
-```
+1. Добавьте Telegram-бота админом в каналы-источники (TG).
+2. Добавьте MAX-бота админом в каналы-назначения (MAX).
+3. Заполните `.env`.
+4. Запустите деплой:
 
 ```bash
 ./scripts/deploy.sh
 ```
 
-Логи:
+Если `config/routes.json` еще нет, `deploy.sh` автоматически вызовет `./bridge.sh` и создаст маршруты вида:
+
+- все обнаруженные TG source-каналы -> все обнаруженные MAX destination-каналы.
+
+## Если каналы добавили позже
+
+После добавления бота в новые каналы выполните:
 
 ```bash
-pm2 logs max-repost-bot --lines 100
+./bridge.sh --force
+./scripts/deploy.sh
 ```
 
-## 5) Важно про медиа
+`--force` пересобирает `config/routes.json`.
 
-- Telegram альбомы (`media_group`) отправляются в MAX одним сообщением с несколькими вложениями.
-- При использовании публичного Bot API большие файлы могут не скачиваться (`file is too big`).
-- Для больших видео/аудио используйте self-hosted `telegram-bot-api` и задайте `TELEGRAM_API_BASE_URL`.
+## Как работает `bridge.sh`
 
-## 6) Безопасность
+`bridge.sh` создает роутинг только если конфига нет (или с `--force`) и проверяет:
 
-- Бот не принимает сообщения из произвольных чатов.
-- Репост происходит только если источник совпал с явным `source` в `config/routes.json`.
-- Если кто-то добавит вашего бота в сторонний канал, сообщения из него будут игнорироваться.
+- в Telegram найдены каналы, где бот админ;
+- в MAX найдены каналы, где бот админ.
+
+Если в одной из сетей каналов нет, конфиг не создается и выводится понятная ошибка: сначала нужно добавить бота админом и повторить запуск.
+
+Важно: Telegram Bot API не дает полного списка чатов бота. Для автообнаружения канал должен быть виден через updates (обычно достаточно, чтобы в канале был новый пост после добавления бота).
+
+## Маршруты
+
+Файл: `config/routes.json`
+
+Поддерживается:
+
+- source:
+  - `telegram` (`chat_id` и/или `chat_username`)
+  - `max` (`chat_id`)
+- destination:
+  - `max` (`chat_id` или `user_id`)
+  - `telegram` (`chat_id`)
+
+## Безопасность
+
+- Репост идет только из источников, явно указанных в `config/routes.json`.
+- Если кто-то добавит бота в сторонний канал, сообщения из него игнорируются.
+- Автовыбор destination в MAX отключен: все назначения задаются только маршрутом.
+
+## Медиа
+
+- Telegram `media_group` (альбом) отправляется в MAX одним сообщением с несколькими вложениями.
+- Для крупных файлов через публичный Telegram Bot API возможен `file is too big`.
+- Для больших видео/аудио используйте self-hosted Bot API и задайте `TELEGRAM_API_BASE_URL`.
