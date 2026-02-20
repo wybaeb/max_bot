@@ -1,48 +1,95 @@
-# Telegram -> MAX repost bot
+# Telegram/MAX bridge
 
-Бот слушает входящие сообщения в Telegram и отправляет их в MAX с задержкой.
+Бот маршрутизирует сообщения между сетями по явным правилам из `config/routes.json`.
 
-## 1) Настройка `.env`
+## 1) Переменные `.env`
 
-Скопируйте `.env.example` в `.env` и заполните:
+Заполните:
 
-- `TELEGRAM_BOT_TOKEN` - токен Telegram-бота
-- `MAX_BOT_TOKEN` - токен MAX-бота
-- `MAX_TARGET_CHAT_ID` или `MAX_TARGET_USER_ID` - куда отправлять в MAX
-- `TELEGRAM_SOURCE_CHAT_IDS` - список Telegram chat id через запятую (опционально)
-- `REPOST_DELAY_MS` - задержка перед репостом, по умолчанию `3000`
-- `TELEGRAM_API_BASE_URL` - base URL Telegram Bot API (`https://api.telegram.org` по умолчанию)
-- `MEDIA_GROUP_COLLECT_MS` - окно сборки Telegram-альбома перед отправкой, по умолчанию `1200`
-- `INCLUDE_TELEGRAM_FOOTER` - добавлять/скрывать футер `tg: [channel](url)`, по умолчанию `true`
+- `TELEGRAM_BOT_TOKEN`
+- `MAX_BOT_TOKEN`
+- `TELEGRAM_API_BASE_URL` (`https://api.telegram.org` или ваш self-hosted Bot API)
+- `ROUTING_CONFIG_PATH` (обычно `config/routes.json`)
+- `DEFAULT_*` (глобальные дефолты, если не заданы в маршруте)
 
-`REMOTE_*` переменные используются скриптом деплоя.
+`REMOTE_*` используются `scripts/deploy.sh`.
 
-## 2) Локальный запуск
+## 2) Маршруты
+
+Файл маршрутов: `config/routes.json`.
+
+Пример структуры:
+
+```json
+{
+  "routes": [
+    {
+      "id": "debug_tg_to_max",
+      "enabled": true,
+      "source": {
+        "network": "telegram",
+        "chat_id": -4720219405
+      },
+      "destinations": [
+        {
+          "network": "max",
+          "chat_id": -71276213876121
+        }
+      ],
+      "options": {
+        "repost_delay_ms": 3000,
+        "media_group_collect_ms": 1200,
+        "include_telegram_footer": true
+      }
+    }
+  ]
+}
+```
+
+Поддерживаемые источники:
+
+- `telegram`: `chat_id` и/или `chat_username`
+- `max`: `chat_id`
+
+Поддерживаемые назначения:
+
+- `max`: ровно одно из `chat_id` или `user_id`
+- `telegram`: `chat_id`
+
+## 3) Что уже добавлено
+
+В `config/routes.json` добавлены 2 маршрута:
+
+- `debug_tg_to_max` (включен): Telegram debug -> MAX `Test Channel`
+- `prod_tg_to_max` (выключен): Telegram source (placeholder) -> MAX `Shuvaev`
+
+Для прод-маршрута укажите реальный `source` и включите `"enabled": true`.
+
+## 4) Запуск и деплой
 
 ```bash
 npm install
 npm start
 ```
 
-## 3) Деплой на сервер
-
-Скрипт деплоя копирует файлы на сервер в `/opt/max_bot`, устанавливает зависимости и запускает процесс через `pm2`.
-
 ```bash
 ./scripts/deploy.sh
 ```
 
-Просмотр логов на сервере:
+Логи:
 
 ```bash
 pm2 logs max-repost-bot --lines 100
 ```
 
-## Важно
+## 5) Важно про медиа
 
-- Telegram-бот должен быть добавлен в нужный чат/канал и иметь доступ к сообщениям.
-- MAX-бот должен быть участником целевого чата (если используете `MAX_TARGET_CHAT_ID`).
-- Поддерживаются основные типы вложений: фото, видео, анимация, аудио/voice и файлы.
 - Telegram альбомы (`media_group`) отправляются в MAX одним сообщением с несколькими вложениями.
-- При использовании публичного Telegram Bot API загрузка некоторых файлов может быть ограничена (ошибка `file is too big`).
-- Если `MAX_TARGET_*` не задан, бот попробует выбрать цель автоматически, но только если у него в MAX ровно один доступный чат.
+- При использовании публичного Bot API большие файлы могут не скачиваться (`file is too big`).
+- Для больших видео/аудио используйте self-hosted `telegram-bot-api` и задайте `TELEGRAM_API_BASE_URL`.
+
+## 6) Безопасность
+
+- Бот не принимает сообщения из произвольных чатов.
+- Репост происходит только если источник совпал с явным `source` в `config/routes.json`.
+- Если кто-то добавит вашего бота в сторонний канал, сообщения из него будут игнорироваться.

@@ -36,13 +36,14 @@ else
 fi
 
 echo "Preparing ${REMOTE_HOST}:${APP_DIR}"
-"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/scripts'"
+"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/scripts' '${APP_DIR}/config'"
 
 echo "Uploading files"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package-lock.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package-lock.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/ecosystem.config.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/ecosystem.config.js"
 "${SCP_CMD[@]}" "${ROOT_DIR}/src/index.js" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/src/index.js"
+"${SCP_CMD[@]}" "${ROOT_DIR}/config/routes.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/config/routes.json"
 "${SCP_CMD[@]}" "${ROOT_DIR}/.env" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/.env"
 
 echo "Installing dependencies and restarting service"
