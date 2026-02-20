@@ -11,6 +11,7 @@
 - `MAX_TARGET_CHAT_ID` или `MAX_TARGET_USER_ID` - куда отправлять в MAX
 - `TELEGRAM_SOURCE_CHAT_IDS` - список Telegram chat id через запятую (опционально)
 - `REPOST_DELAY_MS` - задержка перед репостом, по умолчанию `3000`
+- `INCLUDE_TELEGRAM_FOOTER` - добавлять/скрывать футер `tg: [channel](url)`, по умолчанию `true`
 
 `REMOTE_*` переменные используются скриптом деплоя.
 

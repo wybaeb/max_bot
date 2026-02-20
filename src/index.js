@@ -15,6 +15,17 @@ const parseIntEnv = (name, fallback) => {
   return parsed;
 };
 
+const parseBooleanEnv = (name, fallback) => {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const normalized = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+
+  throw new Error(`Environment variable ${name} must be boolean-like`);
+};
+
 const parseIdList = (value) => {
   if (!value || !value.trim()) return [];
   return value
@@ -47,6 +58,7 @@ const config = {
     : undefined,
   repostDelayMs: parseIntEnv('REPOST_DELAY_MS', 3000),
   sourceChatIds: parseIdList(process.env.TELEGRAM_SOURCE_CHAT_IDS || ''),
+  includeTelegramFooter: parseBooleanEnv('INCLUDE_TELEGRAM_FOOTER', true),
 };
 
 if (config.maxTargetChatId && config.maxTargetUserId) {
@@ -79,27 +91,220 @@ const isAllowedSource = (chatId) => {
   return config.sourceChatIds.includes(chatId);
 };
 
-const getAuthor = (message) => {
-  if (message.sender_chat && message.sender_chat.title) return message.sender_chat.title;
-  if (message.from) {
-    const fullName = [message.from.first_name, message.from.last_name].filter(Boolean).join(' ').trim();
-    if (fullName) return fullName;
-    if (message.from.username) return `@${message.from.username}`;
+const escapeMarkdownText = (value) => {
+  return String(value).replace(/([\\`*_{}\[\]()#+\-.!|>~+])/g, '\\$1');
+};
+
+const normalizeUrl = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    return new URL(raw).toString();
+  } catch {
+    return encodeURI(raw);
   }
-  return 'unknown';
 };
 
-const getSource = (message) => {
-  const chat = message.chat;
-  if (chat.title) return chat.title;
-  const fullName = [chat.first_name, chat.last_name].filter(Boolean).join(' ').trim();
-  return fullName || String(chat.id);
+const hasSupportedAttachment = (messageLike) => {
+  if (!messageLike) return false;
+  return Boolean(
+    (messageLike.photo && messageLike.photo.length)
+      || messageLike.video
+      || messageLike.animation
+      || messageLike.audio
+      || messageLike.voice
+      || messageLike.video_note
+      || messageLike.document,
+  );
 };
 
-const getMessageText = (message) => {
-  const base = message.text || message.caption || '';
-  const header = `TG → MAX | ${getSource(message)} | ${getAuthor(message)}`;
-  return base ? `${header}\n\n${base}` : header;
+const getRepostSource = (message) => {
+  if (hasSupportedAttachment(message)) return message;
+  if (hasSupportedAttachment(message.reply_to_message)) return message.reply_to_message;
+  if (hasSupportedAttachment(message.external_reply)) return message.external_reply;
+  return message;
+};
+
+const extractTextAndEntities = (messageLike) => {
+  if (!messageLike) return { text: '', entities: [] };
+
+  if (typeof messageLike.text === 'string' && messageLike.text.length) {
+    return {
+      text: messageLike.text,
+      entities: Array.isArray(messageLike.entities) ? messageLike.entities : [],
+    };
+  }
+
+  if (typeof messageLike.caption === 'string' && messageLike.caption.length) {
+    return {
+      text: messageLike.caption,
+      entities: Array.isArray(messageLike.caption_entities) ? messageLike.caption_entities : [],
+    };
+  }
+
+  return { text: '', entities: [] };
+};
+
+const buildEntityTree = (textLength, entities) => {
+  const root = {
+    type: 'root',
+    offset: 0,
+    length: textLength,
+    end: textLength,
+    children: [],
+  };
+
+  const sorted = [...entities]
+    .filter((entity) => {
+      if (!entity || typeof entity.offset !== 'number' || typeof entity.length !== 'number') return false;
+      if (entity.length <= 0 || entity.offset < 0) return false;
+      if (entity.offset + entity.length > textLength) return false;
+      return true;
+    })
+    .map((entity) => ({ ...entity, end: entity.offset + entity.length, children: [] }))
+    .sort((a, b) => {
+      if (a.offset !== b.offset) return a.offset - b.offset;
+      return b.length - a.length;
+    });
+
+  const stack = [root];
+
+  for (const entity of sorted) {
+    while (stack.length && entity.offset >= stack[stack.length - 1].end) {
+      stack.pop();
+    }
+
+    const parent = stack[stack.length - 1];
+    if (!parent) continue;
+    if (entity.offset < parent.offset || entity.end > parent.end) {
+      continue;
+    }
+
+    parent.children.push(entity);
+    stack.push(entity);
+  }
+
+  return root;
+};
+
+const wrapEntityAsMarkdown = (entity, innerText, rawText) => {
+  const raw = String(rawText || '');
+  switch (entity.type) {
+    case 'bold':
+      return `**${innerText}**`;
+    case 'italic':
+      return `_${innerText}_`;
+    case 'underline':
+      return `++${innerText}++`;
+    case 'strikethrough':
+      return `~~${innerText}~~`;
+    case 'code':
+      return `\`${raw.replace(/`/g, '\\`')}\``;
+    case 'pre':
+      return `\n\`\`\`\n${raw.replace(/```/g, '``\\`')}\n\`\`\`\n`;
+    case 'text_link':
+      if (entity.url) {
+        return `[${innerText}](${normalizeUrl(entity.url)})`;
+      }
+      return innerText;
+    case 'url':
+      return `[${escapeMarkdownText(raw)}](${normalizeUrl(raw)})`;
+    case 'text_mention':
+      return innerText;
+    default:
+      return innerText;
+  }
+};
+
+const renderNodeAsMarkdown = (node, sourceText) => {
+  let cursor = node.offset;
+  let markdown = '';
+
+  const children = [...(node.children || [])].sort((a, b) => a.offset - b.offset);
+  for (const child of children) {
+    if (child.offset > cursor) {
+      markdown += escapeMarkdownText(sourceText.slice(cursor, child.offset));
+    }
+
+    const innerMarkdown = renderNodeAsMarkdown(child, sourceText);
+    const rawText = sourceText.slice(child.offset, child.end);
+    markdown += wrapEntityAsMarkdown(child, innerMarkdown, rawText);
+    cursor = child.end;
+  }
+
+  if (cursor < node.end) {
+    markdown += escapeMarkdownText(sourceText.slice(cursor, node.end));
+  }
+
+  return markdown;
+};
+
+const formatTelegramTextAsMarkdown = (text, entities) => {
+  if (!text) return '';
+  if (!entities || !entities.length) return escapeMarkdownText(text);
+
+  const root = buildEntityTree(text.length, entities);
+  return renderNodeAsMarkdown(root, text);
+};
+
+const buildTelegramPostUrl = (chat, messageId) => {
+  if (!chat) return '';
+  if (chat.username && messageId) return `https://t.me/${chat.username}/${messageId}`;
+  if (chat.username) return `https://t.me/${chat.username}`;
+  if (!messageId) return '';
+  if (typeof chat.id === 'number') {
+    const id = String(chat.id);
+    if (id.startsWith('-100')) {
+      return `https://t.me/c/${id.slice(4)}/${messageId}`;
+    }
+  }
+  return '';
+};
+
+const getLinkCandidate = (message, source) => {
+  const candidates = [
+    { chat: source.chat, messageId: source.message_id },
+    { chat: message.external_reply?.chat, messageId: message.external_reply?.message_id },
+    { chat: message.external_reply?.origin?.chat, messageId: message.external_reply?.origin?.message_id },
+    { chat: message.reply_to_message?.chat, messageId: message.reply_to_message?.message_id },
+    { chat: message.forward_from_chat, messageId: message.forward_from_message_id },
+    { chat: message.forward_origin?.chat, messageId: message.forward_origin?.message_id },
+    { chat: message.chat, messageId: message.message_id },
+  ];
+
+  for (const candidate of candidates) {
+    const url = buildTelegramPostUrl(candidate.chat, candidate.messageId);
+    if (url) {
+      const name = candidate.chat?.title || (candidate.chat?.username ? `@${candidate.chat.username}` : 'Telegram');
+      return { name, url };
+    }
+  }
+
+  return null;
+};
+
+const getTelegramFooter = (message) => {
+  if (!config.includeTelegramFooter) return '';
+  const source = getRepostSource(message);
+  const sourceLink = getLinkCandidate(message, source);
+  if (!sourceLink) return '';
+
+  return `tg: [${escapeMarkdownText(sourceLink.name)}](${sourceLink.url})`;
+};
+
+const getMessageText = (message, warningText = '') => {
+  const own = extractTextAndEntities(message);
+  const repostSource = getRepostSource(message);
+  const repost = repostSource === message ? { text: '', entities: [] } : extractTextAndEntities(repostSource);
+  const footer = getTelegramFooter(message);
+
+  const parts = [];
+  if (own.text) parts.push(formatTelegramTextAsMarkdown(own.text, own.entities));
+  if (repost.text) parts.push(formatTelegramTextAsMarkdown(repost.text, repost.entities));
+  if (warningText) parts.push(escapeMarkdownText(warningText));
+  if (footer) parts.push(footer);
+
+  return parts.join('\n\n');
 };
 
 const tgFileUrl = async (fileId) => {
@@ -110,31 +315,98 @@ const tgFileUrl = async (fileId) => {
   return `https://api.telegram.org/file/bot${config.telegramToken}/${file.file_path}`;
 };
 
-const buildAttachments = async (message) => {
-  const attachments = [];
+const isTooBigTelegramError = (err) => {
+  const text = err instanceof Error ? err.message : String(err);
+  return /file is too big/i.test(text);
+};
 
-  if (message.photo && message.photo.length) {
-    const largest = message.photo[message.photo.length - 1];
+const uploadByUrl = async (source) => {
+  if (source.photo && source.photo.length) {
+    const largest = source.photo[source.photo.length - 1];
     const imageUrl = await tgFileUrl(largest.file_id);
-    attachments.push((await maxBot.api.uploadImage({ url: imageUrl })).toJson());
-  } else if (message.video) {
-    const videoUrl = await tgFileUrl(message.video.file_id);
-    attachments.push((await maxBot.api.uploadVideo({ url: videoUrl })).toJson());
-  } else if (message.animation) {
-    const animationUrl = await tgFileUrl(message.animation.file_id);
-    attachments.push((await maxBot.api.uploadVideo({ url: animationUrl })).toJson());
-  } else if (message.audio) {
-    const audioUrl = await tgFileUrl(message.audio.file_id);
-    attachments.push((await maxBot.api.uploadAudio({ url: audioUrl })).toJson());
-  } else if (message.voice) {
-    const voiceUrl = await tgFileUrl(message.voice.file_id);
-    attachments.push((await maxBot.api.uploadAudio({ url: voiceUrl })).toJson());
-  } else if (message.document) {
-    const documentUrl = await tgFileUrl(message.document.file_id);
-    attachments.push((await maxBot.api.uploadFile({ url: documentUrl })).toJson());
+    return (await maxBot.api.uploadImage({ url: imageUrl })).toJson();
   }
 
-  return attachments;
+  if (source.video) {
+    const videoUrl = await tgFileUrl(source.video.file_id);
+    return (await maxBot.api.uploadVideo({ url: videoUrl })).toJson();
+  }
+
+  if (source.animation) {
+    const animationUrl = await tgFileUrl(source.animation.file_id);
+    return (await maxBot.api.uploadVideo({ url: animationUrl })).toJson();
+  }
+
+  if (source.audio) {
+    const audioUrl = await tgFileUrl(source.audio.file_id);
+    return (await maxBot.api.uploadAudio({ url: audioUrl })).toJson();
+  }
+
+  if (source.voice) {
+    const voiceUrl = await tgFileUrl(source.voice.file_id);
+    return (await maxBot.api.uploadAudio({ url: voiceUrl })).toJson();
+  }
+
+  if (source.video_note) {
+    const videoNoteUrl = await tgFileUrl(source.video_note.file_id);
+    return (await maxBot.api.uploadVideo({ url: videoNoteUrl })).toJson();
+  }
+
+  if (source.document) {
+    const documentUrl = await tgFileUrl(source.document.file_id);
+    const mime = typeof source.document.mime_type === 'string' ? source.document.mime_type : '';
+    const fileName = typeof source.document.file_name === 'string'
+      ? source.document.file_name.toLowerCase()
+      : '';
+    if (mime.startsWith('video/')) {
+      return (await maxBot.api.uploadVideo({ url: documentUrl })).toJson();
+    }
+    if (mime.startsWith('audio/')) {
+      return (await maxBot.api.uploadAudio({ url: documentUrl })).toJson();
+    }
+    if (fileName.endsWith('.mp4') || fileName.endsWith('.mov') || fileName.endsWith('.mkv') || fileName.endsWith('.webm')) {
+      return (await maxBot.api.uploadVideo({ url: documentUrl })).toJson();
+    }
+    if (fileName.endsWith('.mp3') || fileName.endsWith('.m4a') || fileName.endsWith('.wav') || fileName.endsWith('.ogg')) {
+      return (await maxBot.api.uploadAudio({ url: documentUrl })).toJson();
+    }
+    return (await maxBot.api.uploadFile({ url: documentUrl })).toJson();
+  }
+
+  return null;
+};
+
+const buildAttachments = async (message) => {
+  const source = getRepostSource(message);
+  try {
+    const attachment = await uploadByUrl(source);
+    if (!attachment && hasSupportedAttachment(message)) {
+      log('Media present but not uploadable from Telegram payload', {
+        telegram_chat_id: message.chat.id,
+        telegram_message_id: message.message_id,
+        source_keys: Object.keys(source || {}),
+      });
+    }
+    return {
+      attachments: attachment ? [attachment] : [],
+      warningText: '',
+    };
+  } catch (err) {
+    const warningText = isTooBigTelegramError(err)
+      ? 'Вложение из Telegram не скопировано: файл слишком большой для Bot API.'
+      : 'Вложение из Telegram не скопировано: ошибка получения файла.';
+
+    log('Attachment upload failed', {
+      error: err instanceof Error ? err.message : String(err),
+      telegram_chat_id: message.chat.id,
+      telegram_message_id: message.message_id,
+    });
+
+    return {
+      attachments: [],
+      warningText,
+    };
+  }
 };
 
 const sendToMax = async (text, attachments) => {
@@ -153,16 +425,21 @@ const sendToMax = async (text, attachments) => {
     }
   }
 
-  const payload = attachments.length ? { attachments } : undefined;
+  const payload = {
+    format: 'markdown',
+  };
+  if (attachments.length) payload.attachments = attachments;
+  const safeText = text || ' ';
+
   if (target.chatId) {
-    return maxBot.api.sendMessageToChat(target.chatId, text, payload);
+    return maxBot.api.sendMessageToChat(target.chatId, safeText, payload);
   }
-  return maxBot.api.sendMessageToUser(target.userId, text, payload);
+  return maxBot.api.sendMessageToUser(target.userId, safeText, payload);
 };
 
 const forwardToMax = async (message) => {
-  const text = getMessageText(message);
-  const attachments = await buildAttachments(message);
+  const { attachments, warningText } = await buildAttachments(message);
+  const text = getMessageText(message, warningText);
   await sendToMax(text, attachments);
   log('Reposted message', {
     telegram_chat_id: message.chat.id,
@@ -223,6 +500,7 @@ const bootstrap = async () => {
     max_bot_id: maxMe.user_id,
     repost_delay_ms: config.repostDelayMs,
     restricted_sources: config.sourceChatIds.length > 0,
+    include_telegram_footer: config.includeTelegramFooter,
     target_chat_id: target.chatId,
     target_user_id: target.userId,
   });

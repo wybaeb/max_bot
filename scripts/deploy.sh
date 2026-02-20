@@ -27,8 +27,9 @@ if [[ -n "${REMOTE_PASSWORD:-}" ]]; then
     echo "Install sshpass or clear REMOTE_PASSWORD to use ssh key auth"
     exit 1
   fi
-  SSH_CMD=(sshpass -p "${REMOTE_PASSWORD}" ssh "${SSH_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}")
-  SCP_CMD=(sshpass -p "${REMOTE_PASSWORD}" scp "${SCP_ARGS[@]}")
+  SSH_PASS_ARGS=(-o PubkeyAuthentication=no -o PreferredAuthentications=password -o IdentitiesOnly=yes)
+  SSH_CMD=(sshpass -p "${REMOTE_PASSWORD}" ssh "${SSH_ARGS[@]}" "${SSH_PASS_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}")
+  SCP_CMD=(sshpass -p "${REMOTE_PASSWORD}" scp "${SCP_ARGS[@]}" "${SSH_PASS_ARGS[@]}")
 else
   SSH_CMD=(ssh "${SSH_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}")
   SCP_CMD=(scp "${SCP_ARGS[@]}")
