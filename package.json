@@ -1,0 +1,17 @@
+{
+  "name": "max-telegram-repost-bot",
+  "version": "1.0.0",
+  "description": "Bridge bot: repost from Telegram to MAX with delay",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "dependencies": {
+    "@maxhub/max-bot-api": "^0.2.2",
+    "dotenv": "^16.4.7",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
