@@ -85,6 +85,9 @@ TELEGRAM_API_HASH=
 # DEFAULT_REPOST_DELAY_MS=3000
 # DEFAULT_MEDIA_GROUP_COLLECT_MS=1200
 # DEFAULT_INCLUDE_TELEGRAM_FOOTER=true
+
+# ── Optional – temp-file overflow protection ─────────────────────────────────
+# TEMP_MIN_FREE_MB=1000
 ```
 
 ---
@@ -193,6 +196,25 @@ The public Telegram Bot API limits downloads to **20 MB**. To bridge larger vide
 
 Without MTProto, videos over 20 MB arrive as a text post with:
 > *Вложение из Telegram не скопировано: файл слишком большой для Bot API.*
+
+---
+
+## Temp-file overflow protection
+
+When bridging media the bot downloads files to `os.tmpdir()` before uploading to MAX. Three mechanisms prevent disk exhaustion:
+
+| Mechanism | Behaviour |
+|---|---|
+| **Pre-flight disk check** | Before every download the bridge checks free space in `os.tmpdir()`. If less than `TEMP_MIN_FREE_MB` (default 1000 MB) is available, the download is rejected with an error. Requires Node.js ≥ 19.6; silently skipped on older versions. |
+| **Active-file registry** | Every temp file is registered in an in-memory Set the moment its path is created and removed immediately after the upload completes (in a `finally` block). Both the cron sweeper and the shutdown hook use this Set to avoid touching files that are currently in use. |
+| **Cron sweeper** | On startup and every 15 minutes the bridge scans `os.tmpdir()` for `tg_bridge_*` files older than 30 minutes that are **not** in the active registry and deletes them. This recovers space from files left behind by a previous unclean shutdown. |
+| **SIGTERM / SIGINT cleanup** | When the process receives a shutdown signal it deletes every file still in the active registry (in-flight transfers are aborted anyway) before exiting. |
+
+Tune the threshold in `.env`:
+
+```dotenv
+TEMP_MIN_FREE_MB=1000   # default; set higher on space-constrained servers
+```
 
 ---
 
