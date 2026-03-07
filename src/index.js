@@ -188,6 +188,53 @@ const maxBot = new MaxBot(appConfig.maxToken);
 
 const BOT_API_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // 20 MB hard limit of the public Telegram Bot API
 
+// ---------------------------------------------------------------------------
+// Temp-file overflow protection
+// ---------------------------------------------------------------------------
+
+const TEMP_MIN_FREE_MB = parseIntEnv('TEMP_MIN_FREE_MB', 1000);
+
+/** Paths of temp files currently being downloaded/uploaded. */
+const activeTempFiles = new Set();
+
+/**
+ * Throws if free space in os.tmpdir() is below TEMP_MIN_FREE_MB.
+ * Silently skips on Node versions that don't support fs.statfsSync (< 19.6).
+ */
+const checkDiskSpace = () => {
+  if (typeof fs.statfsSync !== 'function') return;
+  const stats = fs.statfsSync(os.tmpdir());
+  const freeMb = Math.round((stats.bfree * stats.bsize) / (1024 * 1024));
+  if (freeMb < TEMP_MIN_FREE_MB) {
+    throw new Error(
+      `Not enough disk space in ${os.tmpdir()}: ${freeMb} MB free (need ${TEMP_MIN_FREE_MB} MB)`,
+    );
+  }
+};
+
+/**
+ * Deletes stale tg_bridge_* files in os.tmpdir() that are older than maxAgeMs
+ * AND are not currently tracked in activeTempFiles.
+ */
+const cleanStaleTempFiles = (maxAgeMs = 30 * 60 * 1000) => {
+  const dir = os.tmpdir();
+  const now = Date.now();
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith('tg_bridge_')) continue;
+      const file = path.join(dir, name);
+      if (activeTempFiles.has(file)) continue;
+      try {
+        const { mtimeMs } = fs.statSync(file);
+        if (now - mtimeMs > maxAgeMs) {
+          fs.unlinkSync(file);
+          log('Cleaned stale temp file', { file: name });
+        }
+      } catch { /* ignore per-file errors */ }
+    }
+  } catch { /* ignore readdir errors */ }
+};
+
 const state = {
   queue: [],
   queueBusy: false,
@@ -627,10 +674,13 @@ const downloadViaMtproto = async (candidate) => {
 
   const mimeExt = candidate.mime ? candidate.mime.split('/')[1] : 'mp4';
   const ext = `.${mimeExt.replace(/[^a-z0-9]/gi, '') || 'mp4'}`;
+
+  checkDiskSpace();
   const tmpFile = path.join(
     os.tmpdir(),
     `tg_bridge_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`,
   );
+  activeTempFiles.add(tmpFile);
 
   await mtprotoClient.downloadMedia(messages[0], {
     outputFile: tmpFile,
@@ -669,7 +719,10 @@ const uploadLargeMediaViaMtproto = async (candidate) => {
     return result.toJson();
   } finally {
     if (tmpFile) {
-      try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
+      activeTempFiles.delete(tmpFile);
+      try { fs.unlinkSync(tmpFile); } catch (err) {
+        log('Failed to delete MTProto temp file', { file: path.basename(tmpFile), error: err instanceof Error ? err.message : String(err) });
+      }
     }
   }
 };
@@ -719,10 +772,14 @@ const canUseMtprotoFallback = (candidate) =>
 const downloadUrlToTempFile = async (url, mime) => {
   const mimeExt = mime ? mime.split('/')[1] : 'bin';
   const ext = `.${mimeExt.replace(/[^a-z0-9]/gi, '') || 'bin'}`;
+
+  checkDiskSpace();
   const tmpFile = path.join(
     os.tmpdir(),
     `tg_bridge_dl_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`,
   );
+  activeTempFiles.add(tmpFile);
+
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Telegram file download failed: HTTP ${response.status}`);
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -769,7 +826,10 @@ const uploadMediaCandidate = async (candidate) => {
       return (await maxBot.api.uploadFile({ source })).toJson();
     } finally {
       if (tmpFile) {
-        try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
+        activeTempFiles.delete(tmpFile);
+        try { fs.unlinkSync(tmpFile); } catch (err) {
+          log('Failed to delete download temp file', { file: path.basename(tmpFile), error: err instanceof Error ? err.message : String(err) });
+        }
       }
     }
   } catch (err) {
@@ -1108,6 +1168,9 @@ const onMaxMessage = (ctx) => {
 };
 
 const bootstrap = async () => {
+  cleanStaleTempFiles();
+  setInterval(cleanStaleTempFiles, 15 * 60 * 1000).unref();
+
   await initMtprotoClient().catch((err) => {
     log('MTProto init failed (non-fatal, large videos will show warning)', {
       error: err instanceof Error ? err.message : String(err),
@@ -1177,8 +1240,18 @@ const bootstrap = async () => {
   log('MAX listener started');
 };
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+const cleanupAndExit = (signal) => {
+  if (activeTempFiles.size) {
+    log(`${signal}: cleaning up ${activeTempFiles.size} temp file(s)`);
+    for (const file of activeTempFiles) {
+      try { fs.unlinkSync(file); } catch { /* ignore */ }
+    }
+  }
+  process.exit(0);
+};
+
+process.on('SIGINT', () => cleanupAndExit('SIGINT'));
+process.on('SIGTERM', () => cleanupAndExit('SIGTERM'));
 
 bootstrap().catch((err) => {
   log('Fatal startup error', { error: err instanceof Error ? err.message : String(err) });
