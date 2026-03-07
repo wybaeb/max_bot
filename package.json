@@ -5,6 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "bridge": "./bridge.sh",
+    "bridge:discover": "node scripts/bridge-init.js --merge",
+    "bridge:pair": "node scripts/bridge-init.js --add-pair",
     "start": "node src/index.js"
   },
   "engines": {

@@ -55,6 +55,7 @@ const appConfig = {
   routingConfigPath: process.env.ROUTING_CONFIG_PATH
     ? path.resolve(process.cwd(), process.env.ROUTING_CONFIG_PATH)
     : path.resolve(process.cwd(), 'config/routes.json'),
+  discoveredChatsPath: path.resolve(process.cwd(), 'config/discovered-chats.json'),
   defaultRepostDelayMs: parseIntEnv('DEFAULT_REPOST_DELAY_MS', 3000),
   defaultMediaGroupCollectMs: parseIntEnv('DEFAULT_MEDIA_GROUP_COLLECT_MS', 1200),
   defaultIncludeTelegramFooter: parseBooleanEnv('DEFAULT_INCLUDE_TELEGRAM_FOOTER', true),
@@ -198,6 +199,51 @@ const state = {
 let mtprotoClient = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------------------------------------------------------------------------
+// Discovered-chats registry — persisted so bridge-init --merge can find
+// Telegram chats even when the main bot is already consuming getUpdates
+// ---------------------------------------------------------------------------
+
+const _discoveredChats = (() => {
+  let cache = null;
+
+  const load = () => {
+    if (cache) return cache;
+    try {
+      if (fs.existsSync(appConfig.discoveredChatsPath)) {
+        const parsed = JSON.parse(fs.readFileSync(appConfig.discoveredChatsPath, 'utf8'));
+        cache = parsed && typeof parsed.chats === 'object' ? parsed : { chats: {} };
+      } else {
+        cache = { chats: {} };
+      }
+    } catch {
+      cache = { chats: {} };
+    }
+    return cache;
+  };
+
+  return {
+    persist(chat) {
+      if (!chat || !chat.id) return;
+      const key = String(chat.id);
+      const data = load();
+      if (data.chats[key]) return;
+      data.chats[key] = {
+        id: chat.id,
+        type: chat.type,
+        title: chat.title || null,
+        username: chat.username || null,
+      };
+      try {
+        fs.mkdirSync(path.dirname(appConfig.discoveredChatsPath), { recursive: true });
+        fs.writeFileSync(appConfig.discoveredChatsPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+      } catch (err) {
+        log('Failed to persist discovered chat', { error: err instanceof Error ? err.message : String(err) });
+      }
+    },
+  };
+})();
 
 const escapeMarkdownText = (value) => {
   return String(value).replace(/([\\`*_{}\[\]()#+\-.!|>~+])/g, '\\$1');
@@ -1012,6 +1058,8 @@ const logDroppedTelegramMessage = (message) => {
 };
 
 const onTelegramMessage = (message) => {
+  if (message.chat) _discoveredChats.persist(message.chat);
+
   const routes = findTelegramRoutes(message);
   if (!routes.length) {
     logDroppedTelegramMessage(message);
@@ -1035,13 +1083,23 @@ const onMaxMessage = (ctx) => {
     return;
   }
 
+  const text = maxMessage.body?.text || '';
+
+  if (text === '/chatid' || text.startsWith('/chatid ')) {
+    const reply = `Chat ID: \`${ctx.chatId}\``;
+    maxBot.api.sendMessageToChat(ctx.chatId, reply, { format: 'markdown' }).catch((err) => {
+      log('MAX /chatid reply failed', { error: err instanceof Error ? err.message : String(err) });
+    });
+    return;
+  }
+
   const routes = findMaxRoutes(ctx.chatId);
   if (!routes.length) return;
 
   const payload = {
     chatId: ctx.chatId,
     mid: maxMessage.body?.mid,
-    text: maxMessage.body?.text || '',
+    text,
   };
 
   for (const route of routes) {
@@ -1079,32 +1137,44 @@ const bootstrap = async () => {
   }));
   log('Enabled routes', { routes: routeSummary });
 
-  telegram.on('message', onTelegramMessage);
-  telegram.on('channel_post', onTelegramMessage);
+  const handleChatIdCommand = (message) => {
+    if (message.text === '/chatid' || message.text?.startsWith('/chatid@')) {
+      const reply = `Chat ID: \`${message.chat.id}\`\nTitle: ${message.chat.title || '—'}\nType: ${message.chat.type}`;
+      telegram.sendMessage(message.chat.id, reply, { parse_mode: 'Markdown' }).catch(() => {});
+      return true;
+    }
+    return false;
+  };
+
+  telegram.on('message', (message) => {
+    handleChatIdCommand(message);
+    onTelegramMessage(message);
+  });
+  telegram.on('channel_post', (message) => {
+    handleChatIdCommand(message);
+    onTelegramMessage(message);
+  });
   telegram.on('polling_error', (err) => {
     log('Telegram polling error', {
       error: err instanceof Error ? err.message : String(err),
     });
   });
 
-  const hasMaxSourceRoutes = enabledRoutes.some((route) => route.source.network === 'max');
-  if (hasMaxSourceRoutes) {
-    maxBot.on('message_created', onMaxMessage);
-    maxBot.catch((err, ctx) => {
-      log('MAX polling handler error', {
-        error: err instanceof Error ? err.message : String(err),
-        update_type: ctx?.updateType,
-      });
+  maxBot.on('message_created', onMaxMessage);
+  maxBot.catch((err, ctx) => {
+    log('MAX polling handler error', {
+      error: err instanceof Error ? err.message : String(err),
+      update_type: ctx?.updateType,
     });
+  });
 
-    void maxBot.start({ allowedUpdates: ['message_created'] }).catch((err) => {
-      log('MAX polling startup error', {
-        error: err instanceof Error ? err.message : String(err),
-      });
+  void maxBot.start({ allowedUpdates: ['message_created'] }).catch((err) => {
+    log('MAX polling startup error', {
+      error: err instanceof Error ? err.message : String(err),
     });
+  });
 
-    log('MAX source listener started');
-  }
+  log('MAX listener started');
 };
 
 process.on('SIGINT', () => process.exit(0));
