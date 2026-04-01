@@ -2,7 +2,9 @@
 
 require('dotenv').config();
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -59,6 +61,7 @@ const appConfig = {
   defaultRepostDelayMs: parseIntEnv('DEFAULT_REPOST_DELAY_MS', 3000),
   defaultMediaGroupCollectMs: parseIntEnv('DEFAULT_MEDIA_GROUP_COLLECT_MS', 1200),
   defaultIncludeTelegramFooter: parseBooleanEnv('DEFAULT_INCLUDE_TELEGRAM_FOOTER', true),
+  apiPort: parseIntEnv('API_PORT', 3000),
 };
 
 if (appConfig.defaultRepostDelayMs < 0) {
@@ -118,6 +121,9 @@ const validateRoute = (route, index) => {
     if (hasId) ensureNumber(route.source.chat_id, `routes[${id}].source.chat_id`);
   } else if (route.source.network === 'max') {
     ensureNumber(route.source.chat_id, `routes[${id}].source.chat_id`);
+  } else if (route.source.network === 'api') {
+    ensureString(route.source.api_key_env, `routes[${id}].source.api_key_env`);
+    assert(process.env[route.source.api_key_env], `routes[${id}].source: env var ${route.source.api_key_env} is not set`);
   } else {
     throw new Error(`routes[${id}].source.network unsupported: ${route.source.network}`);
   }
@@ -150,6 +156,35 @@ const validateRoute = (route, index) => {
   };
 };
 
+/**
+ * Allows human-readable string IDs in JSON, e.g. "chat_id": "-1002286857270".
+ * Mutates the parsed tree in place before validation.
+ */
+const normalizeNumericIdsInRoutes = (parsed) => {
+  if (!parsed || typeof parsed !== 'object') return;
+
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if ((key === 'chat_id' || key === 'user_id') && typeof node[key] === 'string') {
+        const trimmed = node[key].trim();
+        if (/^-?\d+$/.test(trimmed)) {
+          const n = Number(trimmed);
+          if (Number.isSafeInteger(n)) node[key] = n;
+        }
+      } else {
+        walk(node[key]);
+      }
+    }
+  };
+
+  walk(parsed);
+};
+
 const loadRoutingConfig = (configPath) => {
   if (!fs.existsSync(configPath)) {
     throw new Error(`Routing config not found: ${configPath}`);
@@ -157,6 +192,7 @@ const loadRoutingConfig = (configPath) => {
 
   const raw = fs.readFileSync(configPath, 'utf8');
   const parsed = JSON.parse(raw);
+  normalizeNumericIdsInRoutes(parsed);
 
   assert(Array.isArray(parsed.routes), 'Routing config must include routes[]');
 
@@ -938,6 +974,22 @@ const findMaxRoutes = (chatId) => {
   return getEnabledRoutes().filter((route) => matchMaxSource(route.source, chatId));
 };
 
+const findApiRoutes = (apiKey) => {
+  if (!apiKey) return [];
+  return getEnabledRoutes().filter((route) => {
+    if (route.source.network !== 'api') return false;
+    const routeKey = process.env[route.source.api_key_env];
+    if (!routeKey) return false;
+    try {
+      const a = Buffer.from(apiKey);
+      const b = Buffer.from(routeKey);
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  });
+};
+
 const sendToDestination = async (destination, text, attachments) => {
   if (destination.network === 'max') {
     const payload = { format: 'markdown' };
@@ -987,6 +1039,16 @@ const enqueueMediaGroup = (route, messages) => {
 const enqueueMaxMessage = (route, payload) => {
   state.queue.push({
     kind: 'max_single',
+    route,
+    runAt: Date.now() + getRouteDelayMs(route),
+    payload,
+  });
+  void processQueue();
+};
+
+const enqueueApiMessage = (route, payload) => {
+  state.queue.push({
+    kind: 'api_single',
     route,
     runAt: Date.now() + getRouteDelayMs(route),
     payload,
@@ -1067,6 +1129,12 @@ const forwardMaxSingle = async (route, payload) => {
   });
 };
 
+const forwardApiSingle = async (route, payload) => {
+  const text = payload.text ? String(payload.text) : '';
+  await sendToRouteDestinations(route, text, []);
+  log('Reposted API message', { route_id: route.id });
+};
+
 const processQueue = async () => {
   if (state.queueBusy) return;
   state.queueBusy = true;
@@ -1089,6 +1157,8 @@ const processQueue = async () => {
           await forwardTelegramGroup(next.route, next.messages);
         } else if (next.kind === 'max_single') {
           await forwardMaxSingle(next.route, next.payload);
+        } else if (next.kind === 'api_single') {
+          await forwardApiSingle(next.route, next.payload);
         }
       } catch (err) {
         log('Failed to process queue item', {
@@ -1135,29 +1205,80 @@ const onTelegramMessage = (message) => {
   }
 };
 
+/** Plain text for MAX slash-commands (same rules as @maxhub/max-bot-api Composer.command). */
+const maxPlainTextForSlashCommand = (maxMessage) => {
+  const raw = maxMessage.body?.text;
+  if (typeof raw !== 'string') return '';
+  const myId = state.maxBotUserId;
+  const mention = maxMessage.body.markup?.find((m) => m.type === 'user_mention');
+  if (mention && mention.from === 0 && myId != null && mention.user_id === myId) {
+    return raw.slice(mention.length).trim();
+  }
+  return raw.trim();
+};
+
+const isMaxChatIdCommand = (plain) => plain === '/chatid'
+  || plain.startsWith('/chatid ')
+  || plain.startsWith('/chatid@');
+
+/** Prefer ctx.chatId; fallback to recipient (some payloads differ). */
+const resolveMaxChatId = (ctx, maxMessage) => {
+  const fromCtx = ctx.chatId;
+  if (typeof fromCtx === 'number' && Number.isFinite(fromCtx)) return fromCtx;
+  const r = maxMessage?.recipient?.chat_id;
+  if (typeof r === 'number' && Number.isFinite(r)) return r;
+  return undefined;
+};
+
+const sendMaxChatIdReply = (chatId, label) => {
+  const reply = `Chat ID: \`${chatId}\``;
+  return maxBot.api.sendMessageToChat(chatId, reply, { format: 'markdown' }).catch((err) => {
+    log(`${label} reply failed`, { error: err instanceof Error ? err.message : String(err), chatId });
+  });
+};
+
+/** Fires when the bot is added to a chat — gives chat_id without relying on /chatid. */
+const onMaxBotAdded = (ctx) => {
+  const chatId = ctx.chatId;
+  if (typeof chatId !== 'number' || !Number.isFinite(chatId)) {
+    log('MAX bot_added: missing chat_id on update', { update_type: ctx.updateType });
+    return;
+  }
+  void sendMaxChatIdReply(chatId, 'MAX bot_added chat id');
+};
+
 const onMaxMessage = (ctx) => {
   const maxMessage = ctx.message;
-  if (!maxMessage || !ctx.chatId) return;
+  if (!maxMessage) return;
 
   if (state.maxBotUserId && maxMessage.sender?.user_id === state.maxBotUserId) {
     return;
   }
 
-  const text = maxMessage.body?.text || '';
-
-  if (text === '/chatid' || text.startsWith('/chatid ')) {
-    const reply = `Chat ID: \`${ctx.chatId}\``;
-    maxBot.api.sendMessageToChat(ctx.chatId, reply, { format: 'markdown' }).catch((err) => {
-      log('MAX /chatid reply failed', { error: err instanceof Error ? err.message : String(err) });
-    });
+  const commandPlain = maxPlainTextForSlashCommand(maxMessage);
+  if (isMaxChatIdCommand(commandPlain)) {
+    const id = resolveMaxChatId(ctx, maxMessage);
+    if (id === undefined) {
+      log('MAX /chatid: could not resolve chat_id', {
+        has_recipient: Boolean(maxMessage.recipient),
+        recipient_chat_id: maxMessage.recipient?.chat_id,
+        ctx_chatId: ctx.chatId,
+      });
+      return;
+    }
+    void sendMaxChatIdReply(id, 'MAX /chatid');
     return;
   }
 
-  const routes = findMaxRoutes(ctx.chatId);
+  const maxChatId = resolveMaxChatId(ctx, maxMessage);
+  if (maxChatId === undefined) return;
+
+  const text = maxMessage.body?.text || '';
+  const routes = findMaxRoutes(maxChatId);
   if (!routes.length) return;
 
   const payload = {
-    chatId: ctx.chatId,
+    chatId: maxChatId,
     mid: maxMessage.body?.mid,
     text,
   };
@@ -1165,6 +1286,70 @@ const onMaxMessage = (ctx) => {
   for (const route of routes) {
     enqueueMaxMessage(route, payload);
   }
+};
+
+// ---------------------------------------------------------------------------
+// API HTTP server — receives messages from external sources
+// ---------------------------------------------------------------------------
+
+const handleApiRequest = async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    });
+    res.end();
+    return;
+  }
+
+  if (req.method !== 'POST' || req.url !== '/api/message') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
+  }
+
+  const authHeader = req.headers.authorization || '';
+  const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!tokenMatch) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Missing or invalid Authorization header' }));
+    return;
+  }
+
+  const apiKey = tokenMatch[1];
+  const routes = findApiRoutes(apiKey);
+  if (!routes.length) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid API key' }));
+    return;
+  }
+
+  let body = '';
+  for await (const chunk of req) body += chunk;
+
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    return;
+  }
+
+  if (!payload.text || typeof payload.text !== 'string') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Missing required field: text' }));
+    return;
+  }
+
+  for (const route of routes) {
+    enqueueApiMessage(route, payload);
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, routes_matched: routes.length }));
+  log('API message received', { routes_matched: routes.length });
 };
 
 const bootstrap = async () => {
@@ -1224,6 +1409,7 @@ const bootstrap = async () => {
   });
 
   maxBot.on('message_created', onMaxMessage);
+  maxBot.on('bot_added', onMaxBotAdded);
   maxBot.catch((err, ctx) => {
     log('MAX polling handler error', {
       error: err instanceof Error ? err.message : String(err),
@@ -1231,13 +1417,34 @@ const bootstrap = async () => {
     });
   });
 
-  void maxBot.start({ allowedUpdates: ['message_created'] }).catch((err) => {
+  log(
+    'MAX: using long polling. If /chatid never reacts, remove Webhook for this bot in '
+    + 'MAX (business.max.ru) — Webhook and long polling cannot be used together.',
+  );
+
+  const maxAllowedUpdates = (process.env.MAX_ALLOWED_UPDATES || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const allowedUpdates = maxAllowedUpdates.length
+    ? maxAllowedUpdates
+    : ['message_created', 'message_edited', 'bot_added', 'bot_started', 'message_callback'];
+
+  void maxBot.start({ allowedUpdates }).catch((err) => {
     log('MAX polling startup error', {
       error: err instanceof Error ? err.message : String(err),
     });
   });
 
-  log('MAX listener started');
+  log('MAX listener started', { allowedUpdates });
+
+  const apiRoutes = getEnabledRoutes().filter((r) => r.source.network === 'api');
+  if (apiRoutes.length > 0) {
+    const server = http.createServer(handleApiRequest);
+    server.listen(appConfig.apiPort, () => {
+      log('API HTTP server listening', { port: appConfig.apiPort, api_routes: apiRoutes.length });
+    });
+  }
 };
 
 const cleanupAndExit = (signal) => {
