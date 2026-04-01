@@ -551,6 +551,59 @@ const formatTelegramTextAsMarkdown = (text, entities) => {
   return renderNodeAsMarkdown(root, text);
 };
 
+const escapeHtml = (text) =>
+  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * Converts MAX-style markdown (used throughout the bridge) to Telegram HTML.
+ * Handles both raw markdown (API sources) and backslash-escaped markdown
+ * produced by formatTelegramTextAsMarkdown.
+ */
+const markdownToTelegramHtml = (md) => {
+  if (!md) return '';
+  let text = md;
+
+  // 1. Extract code blocks → <pre>
+  const blocks = [];
+  text = text.replace(/\n?```\n?([\s\S]*?)```\n?/g, (_, c) => {
+    blocks.push(`<pre>${escapeHtml(c.trim())}</pre>`);
+    return `\x00B${blocks.length - 1}\x00`;
+  });
+
+  // 2. Extract inline code → <code>
+  const codes = [];
+  text = text.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(`<code>${escapeHtml(c)}</code>`);
+    return `\x00C${codes.length - 1}\x00`;
+  });
+
+  // 3. Extract links → <a>
+  const links = [];
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    links.push(`<a href="${escapeHtml(url.replace(/\\(.)/g, '$1'))}">${escapeHtml(label.replace(/\\(.)/g, '$1'))}</a>`);
+    return `\x00L${links.length - 1}\x00`;
+  });
+
+  // 4. Unescape markdown backslash escapes (from escapeMarkdownText)
+  text = text.replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, '$1');
+
+  // 5. HTML-escape remaining text (*, _, ~ etc are NOT html-special)
+  text = escapeHtml(text);
+
+  // 6. Markdown → HTML tags
+  text = text.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  text = text.replace(/(?<!\w)_(.+?)_(?!\w)/g, '<i>$1</i>');
+  text = text.replace(/~~(.+?)~~/g, '<s>$1</s>');
+  text = text.replace(/\+\+(.+?)\+\+/g, '<u>$1</u>');
+
+  // 7. Restore placeholders
+  text = text.replace(/\x00B(\d+)\x00/g, (_, i) => blocks[Number(i)]);
+  text = text.replace(/\x00C(\d+)\x00/g, (_, i) => codes[Number(i)]);
+  text = text.replace(/\x00L(\d+)\x00/g, (_, i) => links[Number(i)]);
+
+  return text;
+};
+
 const buildTelegramPostUrl = (chat, messageId) => {
   if (!chat) return '';
   if (chat.username && messageId) return `https://t.me/${chat.username}/${messageId}`;
@@ -1003,8 +1056,8 @@ const sendToDestination = async (destination, text, attachments) => {
   }
 
   if (destination.network === 'telegram') {
-    const safeText = text || ' ';
-    return telegram.sendMessage(destination.chat_id, safeText);
+    const safeText = markdownToTelegramHtml(text) || ' ';
+    return telegram.sendMessage(destination.chat_id, safeText, { parse_mode: 'HTML' });
   }
 
   throw new Error(`Unsupported destination network: ${destination.network}`);
