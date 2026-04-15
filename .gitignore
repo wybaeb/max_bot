@@ -4,4 +4,6 @@ node_modules/
 npm-debug.log*
 config/routes.json
 config/discovered-chats.json
+config/settings.json
+config/backups/
 .mtproto_session

@@ -79,13 +79,15 @@ const logout = (session) => request(session, 'POST', '/admin/logout');
 
 const info = (session) => request(session, 'GET', '/admin/info');
 
-const listRoutes = async (session) => {
-  const result = await request(session, 'GET', '/admin/routes');
+const listRoutes = async (session, opts = {}) => {
+  const qs = opts.reveal ? '?reveal=1' : '';
+  const result = await request(session, 'GET', `/admin/routes${qs}`);
   return result.routes || [];
 };
 
-const getRoute = async (session, routeId) => {
-  const result = await request(session, 'GET', `/admin/routes/${encodeURIComponent(routeId)}`);
+const getRoute = async (session, routeId, opts = {}) => {
+  const qs = opts.reveal ? '?reveal=1' : '';
+  const result = await request(session, 'GET', `/admin/routes/${encodeURIComponent(routeId)}${qs}`);
   return result.route;
 };
 
@@ -108,6 +110,36 @@ const enableRoute = (session, routeId) =>
 const disableRoute = (session, routeId) =>
   request(session, 'POST', `/admin/routes/${encodeURIComponent(routeId)}/disable`);
 
+// ── Settings ─────────────────────────────────────────────────────────────
+
+const getSettings = async (session) => {
+  const res = await request(session, 'GET', '/admin/settings');
+  return res.settings;
+};
+
+const updateSettings = async (session, patch) => {
+  const res = await request(session, 'PUT', '/admin/settings', patch);
+  return res.settings;
+};
+
+// ── Backups ──────────────────────────────────────────────────────────────
+
+const listBackups = async (session) => {
+  const res = await request(session, 'GET', '/admin/backups');
+  return res.backups || [];
+};
+
+const createBackup = async (session, reason) => {
+  const res = await request(session, 'POST', '/admin/backups', { reason: reason || 'manual' });
+  return res.backup;
+};
+
+const restoreBackup = (session, name) =>
+  request(session, 'POST', `/admin/backups/${encodeURIComponent(name)}/restore`);
+
+const deleteBackup = (session, name) =>
+  request(session, 'DELETE', `/admin/backups/${encodeURIComponent(name)}`);
+
 module.exports = {
   ApiError,
   login,
@@ -120,4 +152,10 @@ module.exports = {
   deleteRoute,
   enableRoute,
   disableRoute,
+  getSettings,
+  updateSettings,
+  listBackups,
+  createBackup,
+  restoreBackup,
+  deleteBackup,
 };

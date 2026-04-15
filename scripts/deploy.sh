@@ -50,7 +50,7 @@ fi
 
 echo "Preparing ${REMOTE_HOST}:${APP_DIR}"
 REMOTE_ROUTING_DIR="${APP_DIR}/$(dirname "${ROUTING_CONFIG_PATH}")"
-"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/src/admin' '${APP_DIR}/src/cli' '${APP_DIR}/bin' '${APP_DIR}/scripts' '${APP_DIR}/config' '${REMOTE_ROUTING_DIR}'"
+"${SSH_CMD[@]}" "mkdir -p '${APP_DIR}/src' '${APP_DIR}/src/admin' '${APP_DIR}/src/cli' '${APP_DIR}/bin' '${APP_DIR}/scripts' '${APP_DIR}/config' '${APP_DIR}/config/backups' '${REMOTE_ROUTING_DIR}'"
 
 echo "Uploading files"
 "${SCP_CMD[@]}" "${ROOT_DIR}/package.json" "${REMOTE_USER}@${REMOTE_HOST}:${APP_DIR}/package.json"

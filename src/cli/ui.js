@@ -37,7 +37,17 @@ const formatEndpoint = (node) => {
   if (!node) return '?';
   const net = node.network || '?';
   const icon = icons[net] || '?';
-  if (net === 'api') return `${icon} api:${node.api_key_env || '?'}`;
+  if (net === 'api') {
+    if (node.api_key_env) return `${icon} api:env:${node.api_key_env}`;
+    if (node.api_key) {
+      const k = node.api_key;
+      const hint = node.api_key_masked
+        ? k
+        : (k.length <= 10 ? '***' : `${k.slice(0, 4)}***${k.slice(-4)}`);
+      return `${icon} api:inline(${hint})`;
+    }
+    return `${icon} api:?`;
+  }
 
   const label = node.title
     || (node.chat_username ? `@${node.chat_username}` : null)

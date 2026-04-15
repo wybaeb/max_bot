@@ -76,7 +76,7 @@ const run = async (argv) => {
     .addOption(new Option('--password <password>', 'admin password (prefer stdin/env for security)').env('MAX_BOT_BRIDGE_PASSWORD'))
     .addHelpText('after', `
 Examples:
-  $ max-bot-bridge login 157.180.120.151
+  $ max-bot-bridge login your-server-ip
   $ max-bot-bridge login example.com --port 8080 --scheme https
   $ MAX_BOT_BRIDGE_PASSWORD=secret max-bot-bridge login 10.0.0.5 --password $MAX_BOT_BRIDGE_PASSWORD
 `)
@@ -98,6 +98,7 @@ Examples:
     .alias('ls')
     .description('List all bridging routes with source → destinations')
     .option('--json', 'print the raw JSON array from /admin/routes')
+    .option('--reveal', 'unmask inline api_key values (otherwise masked as abcd***wxyz)')
     .action((opts) => commands.cmdList(opts));
 
   // ── show ──────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ Examples:
     .command('show <id>')
     .description('Show one route in detail (source, destinations, options, raw JSON)')
     .option('--json', 'print raw JSON only')
+    .option('--reveal', 'unmask inline api_key values (otherwise masked as abcd***wxyz)')
     .action((id, opts) => commands.cmdShow(id, opts));
 
   // ── enable / disable ─────────────────────────────────────────────────
@@ -123,10 +125,41 @@ Examples:
     .command('add')
     .description('Add a new route via an interactive wizard (id, source, destinations, options)')
     .addHelpText('after', `
-This command requires a TTY. For scripted setups, write to routes.json
-via the admin API directly, or use the TUI (max-bot-bridge).
+This command requires a TTY. For non-interactive api→X setup use
+\`max-bot-bridge add-api\` (see below).
 `)
     .action(() => commands.cmdAdd());
+
+  // ── add-api (non-interactive, scriptable) ─────────────────────────────
+  program
+    .command('add-api <id>')
+    .description('Create an api-source route in one command (auto-generates a key by default)')
+    .option('--generate-key', 'auto-generate a random 32-byte base64url key (default when neither --key nor --env-var given)')
+    .option('--key <value>', 'use this exact key (>= 16 chars) stored inline in routes.json')
+    .option('--env-var <NAME>', 'reference an env var name instead of inlining the key (UPPER_SNAKE_CASE)')
+    .option('--telegram <chat_id...>', 'destination Telegram chat_id (can be repeated)')
+    .option('--max <chat_id...>', 'destination MAX chat_id (can be repeated)')
+    .option('--max-user <user_id...>', 'destination MAX user_id (DM; can be repeated)')
+    .option('--delay <ms>', 'per-route repost_delay_ms override', parseInt)
+    .option('--disabled', 'create the route in disabled state')
+    .addHelpText('after', `
+Examples:
+  $ max-bot-bridge add-api form-leads --telegram -5075596986
+      → generates a key, prints curl, ready for integration
+
+  $ max-bot-bridge add-api alerts --max -70999607981465 --max -71276213876121
+      → one route → two MAX destinations, key auto-generated
+
+  $ max-bot-bridge add-api ci-bot --env-var API_KEY_CI --telegram -1001234567890
+      → uses a key stored in the server's .env (API_KEY_CI must exist there)
+
+  $ max-bot-bridge add-api import --key "my-preshared-at-least-16-chars" --telegram -1001234567890
+      → pin a specific inline key (not recommended — prefer --generate-key)
+
+After creation, the API key is printed ONCE. Re-reveal later with:
+  $ max-bot-bridge show <id> --reveal
+`)
+    .action((id, opts) => commands.cmdAddApi(id, opts));
 
   // ── edit ─────────────────────────────────────────────────────────────
   program
@@ -141,6 +174,63 @@ via the admin API directly, or use the TUI (max-bot-bridge).
     .description('Delete a route (prompts for confirmation unless --force)')
     .option('-f, --force', 'skip the confirmation prompt')
     .action((id, opts) => commands.cmdRemove(id, opts));
+
+  // ── settings ─────────────────────────────────────────────────────────
+  const settingsCmd = program
+    .command('settings')
+    .description('View or change runtime settings (backup retention count, backup mode)');
+
+  settingsCmd
+    .command('show')
+    .description('Print the effective settings merged with env var overrides')
+    .option('--json', 'print raw JSON')
+    .action((opts) => commands.cmdSettingsShow(opts));
+
+  settingsCmd
+    .command('set <key> <value>')
+    .description('Change a single setting (keys: backups.keep, backups.mode)')
+    .addHelpText('after', `
+Known settings:
+  backups.keep  integer 1..1000   — how many snapshots to retain (default 20)
+  backups.mode  auto | manual     — auto = snapshot before every mutation
+                                    manual = only on 'backup create'
+
+Examples:
+  $ max-bot-bridge settings set backups.keep 50
+  $ max-bot-bridge settings set backups.mode manual
+`)
+    .action((key, value) => commands.cmdSettingsSet(key, value));
+
+  // ── backups ──────────────────────────────────────────────────────────
+  const backupCmd = program
+    .command('backup')
+    .description('Manage snapshots of routes.json (list, create, restore, delete)');
+
+  backupCmd
+    .command('list')
+    .alias('ls')
+    .description('List all available snapshots, newest first')
+    .option('--json', 'print raw JSON')
+    .action((opts) => commands.cmdBackupList(opts));
+
+  backupCmd
+    .command('create')
+    .description('Create a manual snapshot of routes.json right now')
+    .option('--reason <reason>', 'short slug recorded in the filename (default "manual")')
+    .action((opts) => commands.cmdBackupCreate(opts));
+
+  backupCmd
+    .command('restore <name>')
+    .description('Restore routes.json from a named snapshot (hot-reload, no restart)')
+    .option('-f, --force', 'skip the confirmation prompt')
+    .action((name, opts) => commands.cmdBackupRestore(name, opts));
+
+  backupCmd
+    .command('delete <name>')
+    .alias('rm')
+    .description('Delete one snapshot file')
+    .option('-f, --force', 'skip the confirmation prompt')
+    .action((name, opts) => commands.cmdBackupDelete(name, opts));
 
   // ── tui ──────────────────────────────────────────────────────────────
   program

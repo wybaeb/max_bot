@@ -131,6 +131,140 @@ const manageRoute = async (sess, routeId) => {
   }
 };
 
+const backupsMenu = async (sess) => {
+  const inquirer = loadInquirer();
+  while (true) {
+    let backups = [];
+    try { backups = await client.listBackups(sess); }
+    catch (err) { ui.error(err.message || String(err)); return; }
+
+    console.log('');
+    ui.title(`Backups (${backups.length})`);
+    if (!backups.length) {
+      console.log(ui.colors.dim('(no backups yet)'));
+    } else {
+      for (const b of backups.slice(0, 10)) {
+        const when = b.created_at ? new Date(b.created_at).toISOString().replace('T', ' ').slice(0, 19) : '?';
+        console.log(`  ${ui.colors.bold(b.name)}`);
+        console.log(`    ${ui.colors.dim(`${when}  ${b.size} B  reason: ${b.reason}`)}`);
+      }
+      if (backups.length > 10) console.log(ui.colors.dim(`  … +${backups.length - 10} more`));
+    }
+    console.log('');
+
+    const action = await inquirer.select({
+      message: 'Backups menu',
+      choices: [
+        { name: '➕  Create snapshot now', value: 'create' },
+        { name: '↩   Restore from a snapshot', value: 'restore', disabled: !backups.length },
+        { name: '✖   Delete a snapshot', value: 'delete', disabled: !backups.length },
+        { name: ui.colors.dim('← Back'), value: 'back' },
+      ],
+    });
+
+    try {
+      if (action === 'back') return;
+
+      if (action === 'create') {
+        const reason = await inquirer.input({ message: 'Reason (short slug):', default: 'manual' });
+        const created = await client.createBackup(sess, reason);
+        ui.success(`Created ${created.name}`);
+        continue;
+      }
+
+      if (action === 'restore' || action === 'delete') {
+        const name = await inquirer.select({
+          message: action === 'restore' ? 'Restore from which snapshot?' : 'Delete which snapshot?',
+          pageSize: Math.min(20, Math.max(5, backups.length)),
+          choices: [
+            ...backups.map((b) => ({
+              name: `${b.name}  ${ui.colors.dim(`(${b.reason}, ${b.size} B)`)}`,
+              value: b.name,
+            })),
+            { name: ui.colors.dim('← Back'), value: '__back__' },
+          ],
+        });
+        if (name === '__back__') continue;
+
+        const ok = await inquirer.confirm({
+          message: action === 'restore'
+            ? `Restore routes.json from "${name}"? Current state will be overwritten.`
+            : `Delete backup "${name}"?`,
+          default: false,
+        });
+        if (!ok) { ui.info('Aborted.'); continue; }
+
+        if (action === 'restore') {
+          const res = await client.restoreBackup(sess, name);
+          ui.success(`Restored from "${name}" (${res.routes_total} routes now live)`);
+        } else {
+          await client.deleteBackup(sess, name);
+          ui.success(`Deleted "${name}"`);
+        }
+      }
+    } catch (err) {
+      ui.error(err.message || String(err));
+    }
+  }
+};
+
+const settingsMenu = async (sess) => {
+  const inquirer = loadInquirer();
+  while (true) {
+    let settings;
+    try { settings = await client.getSettings(sess); }
+    catch (err) { ui.error(err.message || String(err)); return; }
+
+    console.log('');
+    ui.title('Settings');
+    console.log(`  ${ui.colors.bold('backups.keep:')}  ${settings.backups.keep}`);
+    console.log(`  ${ui.colors.bold('backups.mode:')}  ${settings.backups.mode}    ${ui.colors.dim('(auto = snapshot before every change)')}`);
+    console.log('');
+
+    const action = await inquirer.select({
+      message: 'Settings menu',
+      choices: [
+        { name: `Change backups.keep (current: ${settings.backups.keep})`, value: 'keep' },
+        { name: `Change backups.mode (current: ${settings.backups.mode})`, value: 'mode' },
+        { name: ui.colors.dim('← Back'), value: 'back' },
+      ],
+    });
+
+    try {
+      if (action === 'back') return;
+
+      if (action === 'keep') {
+        const raw = await inquirer.input({
+          message: 'backups.keep (1..1000):',
+          default: String(settings.backups.keep),
+          validate: (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) && n >= 1 && n <= 1000 ? true : 'Integer 1..1000';
+          },
+        });
+        await client.updateSettings(sess, { backups: { keep: Number(raw) } });
+        ui.success(`backups.keep = ${raw}`);
+        continue;
+      }
+
+      if (action === 'mode') {
+        const mode = await inquirer.select({
+          message: 'backups.mode:',
+          default: settings.backups.mode,
+          choices: [
+            { name: 'auto  — snapshot before every mutation', value: 'auto' },
+            { name: 'manual — only via `backup create` / TUI', value: 'manual' },
+          ],
+        });
+        await client.updateSettings(sess, { backups: { mode } });
+        ui.success(`backups.mode = ${mode}`);
+      }
+    } catch (err) {
+      ui.error(err.message || String(err));
+    }
+  }
+};
+
 const mainMenu = async () => {
   printHeader();
   const sess = await ensureSession();
@@ -165,6 +299,8 @@ const mainMenu = async () => {
         { name: '📋  List all routes', value: 'list' },
         { name: '🔧  Manage a route (edit / enable / disable / delete)', value: 'manage' },
         { name: '➕  Add a new route', value: 'add' },
+        { name: '🛡   Backups (list / create / restore / delete)', value: 'backups' },
+        { name: '⚙   Settings (retention, auto/manual mode)', value: 'settings' },
         { name: '👤  Who am I / session info', value: 'whoami' },
         { name: '🚪  Logout', value: 'logout' },
         { name: '❌  Quit', value: 'quit' },
@@ -198,6 +334,16 @@ const mainMenu = async () => {
         if (!ok) { ui.info('Aborted.'); continue; }
         await client.createRoute(sess, route);
         ui.success(`Created route "${route.id}"`);
+        continue;
+      }
+
+      if (choice === 'backups') {
+        await backupsMenu(sess);
+        continue;
+      }
+
+      if (choice === 'settings') {
+        await settingsMenu(sess);
         continue;
       }
 

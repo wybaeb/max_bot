@@ -14,6 +14,7 @@ A lightweight Node.js bridge that automatically reposts messages from **Telegram
 - **Large videos (> 20 MB)** — downloaded via MTProto (requires optional `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`)
 - **Media albums** — Telegram `media_group` arrives as a single MAX message with multiple attachments
 - **Source footer** — optional "tg: [Channel](link)" footer on every reposted message
+- **Sender name** — optional bold sender name prefix for group-to-group bridges
 - **Multiple routes** — fan-out from one source to many destinations, or many independent routes
 - **API ingest** — accept messages from external sources via authenticated HTTP endpoint (`POST /api/message`)
 - **Queue with delay** — configurable per-route repost delay to avoid rate limits
@@ -118,16 +119,49 @@ Routes live in `config/routes.json` (gitignored — generated per deployment).
       "options": {
         "repost_delay_ms": 3000,
         "media_group_collect_ms": 1200,
-        "include_telegram_footer": true
+        "include_telegram_footer": true,
+        "include_sender_name": true
       }
     }
   ]
 }
 ```
 
+### Route options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `repost_delay_ms` | number | `3000` | Delay before reposting (rate-limit protection) |
+| `media_group_collect_ms` | number | `1200` | Wait time to collect all parts of a media album |
+| `include_telegram_footer` | boolean | `true` | Append "tg: [Channel](link)" footer |
+| `include_sender_name` | boolean | `false` | Prepend **sender's name** (bold) to the message — useful for group-to-group bridges where you need to see who wrote the original |
+
 ### API source
 
-To accept messages from external systems (CI/CD, monitoring, other bots), use `"network": "api"`:
+To accept messages from external systems (CI/CD, monitoring, form
+submissions, other bots), use `"network": "api"`. Two ways to hold the
+Bearer token:
+
+**Inline** — stored directly in `routes.json` (self-contained, no env
+var needed; the CLI auto-generates a secure key for you):
+
+```jsonc
+{
+  "id": "form_leads_to_tg",
+  "enabled": true,
+  "source": {
+    "network": "api",
+    "api_key": "Rv-XnHTYA46euHdNuAs-KbzMAWZfBf60HoSRF7_1QBI"  // >= 16 chars
+  },
+  "destinations": [
+    { "network": "telegram", "chat_id": -5075596986 }
+  ]
+}
+```
+
+**Env var reference** — key lives in `.env`, `routes.json` only stores the
+name. Useful if you want secrets separated from config or managed by a
+secrets-manager that writes `.env` for you:
 
 ```jsonc
 {
@@ -135,7 +169,7 @@ To accept messages from external systems (CI/CD, monitoring, other bots), use `"
   "enabled": true,
   "source": {
     "network": "api",
-    "api_key_env": "API_KEY_ALERTS"   // name of the env var holding the Bearer token
+    "api_key_env": "API_KEY_ALERTS"   // name of the env var in the bot's .env
   },
   "destinations": [
     { "network": "max", "chat_id": -70999000000000 },
@@ -145,7 +179,8 @@ To accept messages from external systems (CI/CD, monitoring, other bots), use `"
 }
 ```
 
-The HTTP server starts automatically when at least one API route is present. Send messages with:
+The HTTP server starts automatically when at least one API route is
+present (or when `ADMIN_PASSWORD` is set). Send messages with:
 
 ```bash
 curl -X POST http://your-server:3000/api/message \
@@ -191,15 +226,45 @@ default `3000`).
 # On your laptop, anywhere the repo is cloned and `npm install`ed:
 npx max-bot-bridge                       # interactive TUI (recommended)
 npx max-bot-bridge --help                # full command reference
-npx max-bot-bridge login 157.180.120.151 # password prompted interactively
+npx max-bot-bridge login your-server-ip # password prompted interactively
 npx max-bot-bridge list                  # list all routes
 npx max-bot-bridge show my_route
+npx max-bot-bridge show my_route --reveal  # show unmasked inline api_key
 npx max-bot-bridge disable my_route
 npx max-bot-bridge enable  my_route
-npx max-bot-bridge add                   # wizard: source, destinations, options
+npx max-bot-bridge add                   # interactive wizard (any source type)
+npx max-bot-bridge add-api form_leads --telegram -5075596986
+                                         # one-shot: auto-gen key + print curl
 npx max-bot-bridge edit    my_route
 npx max-bot-bridge remove  my_route      # prompts; --force skips confirmation
 ```
+
+### One-shot API route creation
+
+For quick integrations (forms, webhooks, CI alerts, other bots),
+`add-api` creates a complete route in a single command — no editing
+`routes.json`, no `.env` changes, no redeploy:
+
+```bash
+max-bot-bridge add-api form_leads --telegram -5075596986
+```
+
+Output includes the generated 32-byte Bearer key (shown **once** — save
+it), a masked summary, and a ready-to-paste `curl` example pointing at
+your server. Multiple destinations and env-var keys are also supported:
+
+```bash
+# Fan-out to MAX + Telegram, auto-generated key
+max-bot-bridge add-api alerts \
+  --max -70999607981465 \
+  --telegram -1001234567890
+
+# Use a key stored in the server's .env instead of inlining it
+max-bot-bridge add-api ci-bot --env-var API_KEY_CI --telegram -1001234567890
+```
+
+Inline keys are masked in `list`/`show` output by default
+(`abcd***wxyz`). Re-reveal with `max-bot-bridge show <id> --reveal`.
 
 Running `max-bot-bridge` with **no arguments** opens an arrow-key menu:
 
@@ -208,7 +273,7 @@ Running `max-bot-bridge` with **no arguments** opens an arrow-key menu:
 │      max-bot-bridge — bridge CLI       │
 ╰────────────────────────────────────────╯
 
-server: http://157.180.120.151:3000
+server: http://your-server-ip:3000
 routes: 9 enabled / 9 total
 
 ? Main menu
@@ -255,10 +320,72 @@ token, set `Authorization: Bearer <token>` on every subsequent request.
 | DELETE | `/admin/routes/:id`               | –                    | remove                                |
 | POST   | `/admin/routes/:id/enable`        | –                    | toggle enabled=true                   |
 | POST   | `/admin/routes/:id/disable`       | –                    | toggle enabled=false                  |
+| GET    | `/admin/settings`                 | –                    | backup retention + mode               |
+| PUT    | `/admin/settings`                 | partial settings     | validates, persists to settings.json  |
+| GET    | `/admin/backups`                  | –                    | list snapshots (newest first)         |
+| POST   | `/admin/backups`                  | `{reason}`           | manual snapshot                       |
+| POST   | `/admin/backups/:name/restore`    | –                    | atomically restore from snapshot      |
+| DELETE | `/admin/backups/:name`            | –                    | delete one snapshot                   |
 
 Every mutation atomically rewrites `routes.json` and hot-reloads the bot
 (no process restart). If the new config fails validation, the previous
 file is restored and the API returns `400` with the error.
+
+### Backups & settings
+
+Every mutation of `routes.json` is preceded by a timestamped snapshot
+stored next to the live file:
+
+```
+config/
+  routes.json
+  settings.json            # runtime settings (retention / mode)
+  backups/
+    routes-20260411-143022-add_my_route.json
+    routes-20260411-143108-disable_debug_tg_to_max.json
+    …
+```
+
+By default the bot keeps the **20 most recent** snapshots and creates a
+new one automatically before **every** change (add / edit / enable /
+disable / remove / restore). Older files are pruned after each new
+snapshot.
+
+Retention and mode are controlled by two settings:
+
+| Setting         | Default | Range / values       | Meaning                                       |
+|-----------------|---------|----------------------|-----------------------------------------------|
+| `backups.keep`  | `20`    | integer `1..1000`    | how many snapshots to retain                  |
+| `backups.mode`  | `auto`  | `auto` \| `manual`   | `auto` snapshots before every change;  `manual` only via `backup create` |
+
+Change them at runtime via the CLI (stored in `config/settings.json`):
+
+```bash
+max-bot-bridge settings show
+max-bot-bridge settings set backups.keep 50
+max-bot-bridge settings set backups.mode manual
+```
+
+Or hard-lock them via `.env` (the env vars win over `settings.json` on
+every reload):
+
+```dotenv
+BACKUPS_KEEP=20
+BACKUPS_MODE=auto
+```
+
+Manage snapshots directly:
+
+```bash
+max-bot-bridge backup list                           # newest first
+max-bot-bridge backup create --reason "pre-refactor" # on-demand snapshot
+max-bot-bridge backup restore routes-20260411-143022-add_my_route.json
+max-bot-bridge backup delete  routes-20260411-143022-add_my_route.json --force
+```
+
+Restoring a snapshot goes through the same validation pipeline as any
+other mutation — if the restored file fails validation the previous
+state is kept and the CLI returns a non-zero exit code.
 
 ---
 

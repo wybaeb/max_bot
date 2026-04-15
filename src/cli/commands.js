@@ -95,7 +95,7 @@ const cmdWhoami = async () => {
 
 const cmdList = async (opts = {}) => {
   const sess = session.requireSession();
-  const routes = await client.listRoutes(sess);
+  const routes = await client.listRoutes(sess, { reveal: Boolean(opts.reveal) });
   if (opts.json) {
     console.log(JSON.stringify(routes, null, 2));
     return;
@@ -108,7 +108,7 @@ const cmdList = async (opts = {}) => {
 
 const cmdShow = async (routeId, opts = {}) => {
   const sess = session.requireSession();
-  const route = await client.getRoute(sess, routeId);
+  const route = await client.getRoute(sess, routeId, { reveal: Boolean(opts.reveal) });
   if (opts.json) {
     console.log(JSON.stringify(route, null, 2));
     return;
@@ -225,13 +225,43 @@ const wizardCollectSource = async (prefill = {}) => {
     return { network: 'max', chat_id };
   }
 
-  // api
-  const api_key_env = await inquirer.input({
-    message: 'Env var holding the Bearer token (e.g. API_KEY_ALERTS):',
-    default: prefill.api_key_env || '',
-    validate: (v) => /^[A-Z][A-Z0-9_]*$/.test(v) ? true : 'Use UPPER_SNAKE_CASE',
+  // api — inline key or env-var reference
+  const mode = await inquirer.select({
+    message: 'API key mode:',
+    default: prefill.api_key_env ? 'env' : 'inline',
+    choices: [
+      { name: 'Inline (stored in routes.json) — auto-generate a random key', value: 'inline' },
+      { name: 'Env var (reference a .env variable — more isolation)', value: 'env' },
+    ],
   });
-  return { network: 'api', api_key_env };
+
+  if (mode === 'env') {
+    const api_key_env = await inquirer.input({
+      message: 'Env var holding the Bearer token (e.g. API_KEY_ALERTS):',
+      default: prefill.api_key_env || '',
+      validate: (v) => /^[A-Z][A-Z0-9_]*$/.test(v) ? true : 'Use UPPER_SNAKE_CASE',
+    });
+    return { network: 'api', api_key_env };
+  }
+
+  // inline
+  const generate = await inquirer.confirm({
+    message: 'Auto-generate a random 32-byte key?',
+    default: !prefill.api_key,
+  });
+  let api_key;
+  if (generate) {
+    api_key = require('node:crypto').randomBytes(32).toString('base64url');
+    ui.info(`Generated key: ${api_key}`);
+    ui.warn('Copy it now — after creation it will be masked in show/list output (use --reveal to see it again).');
+  } else {
+    api_key = await inquirer.input({
+      message: 'Inline API key (>= 16 chars):',
+      default: prefill.api_key || '',
+      validate: (v) => (typeof v === 'string' && v.length >= 16) ? true : 'At least 16 characters',
+    });
+  }
+  return { network: 'api', api_key };
 };
 
 const wizardCollectSingleDestination = async (prefill = {}) => {
@@ -338,6 +368,109 @@ const cmdAdd = async () => {
   ui.success(`Created route "${created.id}"`);
 };
 
+// ── add-api ──────────────────────────────────────────────────────────────
+
+/**
+ * One-shot non-interactive creator for api→X routes.
+ *
+ * Usage:
+ *   max-bot-bridge add-api <id> [--generate-key|--key <v>|--env-var <NAME>]
+ *                               [--telegram <id>]... [--max <id>]...
+ *                               [--max-user <id>]... [--delay <ms>] [--disabled]
+ */
+const cmdAddApi = async (routeId, opts = {}) => {
+  const sess = session.requireSession();
+
+  if (!routeId || !/^[a-zA-Z0-9_\-.:]+$/.test(routeId)) {
+    throw Object.assign(new Error('Route id must contain only letters, digits, _ - . :'), { exitCode: 1 });
+  }
+
+  // ── build source ─────────────────────────────────────────────────────
+  const source = { network: 'api' };
+  let generatedKey = null;
+
+  if (opts.envVar) {
+    if (opts.key || opts.generateKey) {
+      throw new Error('Cannot combine --env-var with --key / --generate-key');
+    }
+    if (!/^[A-Z][A-Z0-9_]*$/.test(opts.envVar)) {
+      throw new Error(`--env-var "${opts.envVar}" must be UPPER_SNAKE_CASE`);
+    }
+    source.api_key_env = opts.envVar;
+  } else if (opts.key) {
+    if (String(opts.key).length < 16) throw new Error('--key must be at least 16 characters');
+    source.api_key = String(opts.key);
+  } else {
+    // default: generate
+    generatedKey = require('node:crypto').randomBytes(32).toString('base64url');
+    source.api_key = generatedKey;
+  }
+
+  // ── build destinations ───────────────────────────────────────────────
+  const destinations = [];
+  const pushList = (raw, mapFn) => {
+    if (!raw) return;
+    const arr = Array.isArray(raw) ? raw : [raw];
+    for (const item of arr) destinations.push(mapFn(item));
+  };
+  pushList(opts.telegram, (v) => ({ network: 'telegram', chat_id: Number(v) }));
+  pushList(opts.max, (v) => ({ network: 'max', chat_id: Number(v) }));
+  pushList(opts.maxUser, (v) => ({ network: 'max', user_id: Number(v) }));
+
+  if (!destinations.length) {
+    throw new Error('At least one destination is required (--telegram, --max or --max-user)');
+  }
+
+  for (const d of destinations) {
+    const num = d.chat_id ?? d.user_id;
+    if (!Number.isFinite(num)) throw new Error(`Invalid numeric id in destination: ${JSON.stringify(d)}`);
+  }
+
+  // ── assemble route ───────────────────────────────────────────────────
+  const route = {
+    id: routeId,
+    enabled: !opts.disabled,
+    source,
+    destinations,
+  };
+  if (opts.delay !== undefined) {
+    route.options = { repost_delay_ms: Number(opts.delay) };
+  }
+
+  const created = await client.createRoute(sess, route);
+
+  // ── success output ───────────────────────────────────────────────────
+  ui.success(`Created route "${created.id}"`);
+  console.log('');
+  console.log(ui.renderRouteFull(created));
+  console.log('');
+
+  const port = sess.port || 3000;
+  const scheme = sess.scheme || 'http';
+  const endpoint = `${scheme}://${sess.host}:${port}/api/message`;
+
+  if (generatedKey || source.api_key) {
+    const key = generatedKey || source.api_key;
+    ui.title('🔑 Save this API key now — it will be masked on next read');
+    console.log(key);
+    console.log('');
+    ui.info('Re-reveal later with:');
+    console.log(`  max-bot-bridge show ${routeId} --reveal`);
+    console.log('');
+    ui.title('Ready-to-paste curl');
+    console.log(`curl -X POST ${endpoint} \\`);
+    console.log(`  -H "Authorization: Bearer ${key}" \\`);
+    console.log(`  -H "Content-Type: application/json" \\`);
+    console.log(`  -d '{"text": "hello from your app"}'`);
+  } else {
+    ui.title('Ready-to-paste curl (env var on your side)');
+    console.log(`curl -X POST ${endpoint} \\`);
+    console.log(`  -H "Authorization: Bearer $${source.api_key_env}" \\`);
+    console.log(`  -H "Content-Type: application/json" \\`);
+    console.log(`  -d '{"text": "hello from your app"}'`);
+  }
+};
+
 // ── edit <id> ────────────────────────────────────────────────────────────
 
 const cmdEdit = async (routeId) => {
@@ -381,6 +514,133 @@ const cmdEdit = async (routeId) => {
   console.log(ui.formatRoute(updated));
 };
 
+// ── Settings ─────────────────────────────────────────────────────────────
+
+const cmdSettingsShow = async (opts = {}) => {
+  const sess = session.requireSession();
+  const settings = await client.getSettings(sess);
+  if (opts.json) {
+    console.log(JSON.stringify(settings, null, 2));
+    return;
+  }
+  ui.title('Settings');
+  console.log(`${ui.colors.bold('backups.keep:')}  ${settings.backups.keep}`);
+  console.log(`${ui.colors.bold('backups.mode:')}  ${settings.backups.mode}    ${ui.colors.dim('(auto = snapshot before every change, manual = only on `backup create`)')}`);
+};
+
+const SETTING_KEYS = {
+  'backups_keep': { path: ['backups', 'keep'], type: 'int' },
+  'backups.keep': { path: ['backups', 'keep'], type: 'int' },
+  'backups_mode': { path: ['backups', 'mode'], type: 'enum', choices: ['auto', 'manual'] },
+  'backups.mode': { path: ['backups', 'mode'], type: 'enum', choices: ['auto', 'manual'] },
+};
+
+const buildSettingsPatch = (key, rawValue) => {
+  const spec = SETTING_KEYS[key];
+  if (!spec) {
+    const known = Object.keys(SETTING_KEYS).filter((k) => k.includes('.')).join(', ');
+    throw Object.assign(new Error(`Unknown setting "${key}". Known: ${known}`), { exitCode: 1 });
+  }
+  let value = rawValue;
+  if (spec.type === 'int') {
+    const n = Number(rawValue);
+    if (!Number.isFinite(n)) throw new Error(`Setting "${key}" requires an integer`);
+    value = Math.round(n);
+  } else if (spec.type === 'enum') {
+    if (!spec.choices.includes(String(rawValue))) {
+      throw new Error(`Setting "${key}" must be one of: ${spec.choices.join(', ')}`);
+    }
+  }
+  const patch = {};
+  let cursor = patch;
+  for (let i = 0; i < spec.path.length - 1; i += 1) {
+    cursor[spec.path[i]] = {};
+    cursor = cursor[spec.path[i]];
+  }
+  cursor[spec.path[spec.path.length - 1]] = value;
+  return patch;
+};
+
+const cmdSettingsSet = async (key, value) => {
+  const sess = session.requireSession();
+  const patch = buildSettingsPatch(key, value);
+  const updated = await client.updateSettings(sess, patch);
+  ui.success(`Updated ${key} = ${value}`);
+  ui.info(`Effective settings: ${JSON.stringify(updated)}`);
+};
+
+// ── Backups ──────────────────────────────────────────────────────────────
+
+const formatAge = (iso) => {
+  if (!iso) return '?';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(diffMs)) return '?';
+  const s = Math.round(diffMs / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  return `${d}d ago`;
+};
+
+const cmdBackupList = async (opts = {}) => {
+  const sess = session.requireSession();
+  const backups = await client.listBackups(sess);
+  if (opts.json) {
+    console.log(JSON.stringify(backups, null, 2));
+    return;
+  }
+  ui.title(`Backups (${backups.length})`);
+  if (!backups.length) {
+    console.log(ui.colors.dim('(no backups yet)'));
+    return;
+  }
+  for (const b of backups) {
+    const when = b.created_at ? new Date(b.created_at).toISOString().replace('T', ' ').slice(0, 19) : '?';
+    const size = b.size ? `${b.size} B` : '';
+    console.log(`${ui.colors.bold(b.name)}`);
+    console.log(`  ${ui.colors.dim(`${when}  ${formatAge(b.created_at)}  ${size}  reason: ${b.reason}`)}`);
+  }
+};
+
+const cmdBackupCreate = async (opts = {}) => {
+  const sess = session.requireSession();
+  const reason = opts.reason || 'manual';
+  const created = await client.createBackup(sess, reason);
+  ui.success(`Created backup: ${created.name}`);
+  ui.info(`size: ${created.size} B, reason: ${created.reason}`);
+};
+
+const cmdBackupRestore = async (name, opts = {}) => {
+  const sess = session.requireSession();
+  if (!opts.force) {
+    const inquirer = loadInquirer();
+    const ok = await inquirer.confirm({
+      message: `Restore routes.json from "${name}"? Current state will be overwritten.`,
+      default: false,
+    });
+    if (!ok) { ui.info('Aborted.'); return; }
+  }
+  const result = await client.restoreBackup(sess, name);
+  ui.success(`Restored from "${name}" (${result.routes_total} routes now live)`);
+};
+
+const cmdBackupDelete = async (name, opts = {}) => {
+  const sess = session.requireSession();
+  if (!opts.force) {
+    const inquirer = loadInquirer();
+    const ok = await inquirer.confirm({
+      message: `Delete backup "${name}"? This cannot be undone.`,
+      default: false,
+    });
+    if (!ok) { ui.info('Aborted.'); return; }
+  }
+  await client.deleteBackup(sess, name);
+  ui.success(`Deleted "${name}"`);
+};
+
 module.exports = {
   cmdLogin,
   cmdLogout,
@@ -391,7 +651,14 @@ module.exports = {
   cmdDisable,
   cmdRemove,
   cmdAdd,
+  cmdAddApi,
   cmdEdit,
+  cmdSettingsShow,
+  cmdSettingsSet,
+  cmdBackupList,
+  cmdBackupCreate,
+  cmdBackupRestore,
+  cmdBackupDelete,
   wizardCollectRoute,
   wizardCollectSource,
   wizardCollectDestinations,

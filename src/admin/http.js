@@ -28,6 +28,9 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const { createSettingsStore } = require('./settings');
+const { createBackupStore } = require('./backups');
+
 const SESSION_TTL_MS = 365 * 24 * 60 * 60 * 1000; // 1 year — "maximally long" per user request
 const LOGIN_WINDOW_MS = 60_000;
 const LOGIN_MAX_ATTEMPTS = 5;
@@ -76,6 +79,35 @@ const getBearerToken = (req) => {
   return match ? match[1].trim() : null;
 };
 
+/**
+ * Replaces any inline `source.api_key` with a masked form
+ * (first 4 + "***" + last 4 chars) for safe display in list/show responses.
+ * Pass { reveal: true } to leave the field untouched.
+ */
+const maskRouteKey = (route, { reveal = false } = {}) => {
+  if (reveal) return route;
+  if (!route || route.source?.network !== 'api') return route;
+  if (typeof route.source.api_key !== 'string' || !route.source.api_key) return route;
+  const k = route.source.api_key;
+  const masked = k.length <= 10
+    ? '***'
+    : `${k.slice(0, 4)}***${k.slice(-4)}`;
+  return {
+    ...route,
+    source: { ...route.source, api_key: masked, api_key_masked: true },
+  };
+};
+
+const parseQueryBool = (req) => {
+  try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    const v = url.searchParams.get('reveal');
+    return v === '1' || v === 'true' || v === 'yes';
+  } catch {
+    return false;
+  }
+};
+
 const createAdminHandler = ({
   adminPassword,
   routingConfigPath,
@@ -85,6 +117,10 @@ const createAdminHandler = ({
 }) => {
   const sessions = new Map();           // token → { issuedAt, expiresAt }
   const loginAttempts = new Map();       // ip → [timestamps]
+
+  const settingsPath = path.join(path.dirname(routingConfigPath), 'settings.json');
+  const settingsStore = createSettingsStore({ settingsPath, log });
+  const backupStore = createBackupStore({ routingConfigPath, log });
 
   const purgeExpired = () => {
     const now = Date.now();
@@ -128,17 +164,42 @@ const createAdminHandler = ({
 
   /**
    * Writes a new routes array to disk and triggers an in-memory reload.
-   * If reload fails validation, the previous file is restored and the error
-   * is re-thrown so the HTTP handler can return a 400.
+   * If reload fails validation, the previous file is restored and the
+   * error is rethrown so the HTTP handler can return 400.
+   *
+   * When settings.backups.mode === "auto", a timestamped snapshot of the
+   * pre-change routes.json is created first and pruned to settings.keep.
+   * If the subsequent write/reload fails, that just-created backup is
+   * removed to avoid duplicate rollback records.
+   *
+   * @param {Array}  nextRoutes  new routes[] to persist
+   * @param {string} reason      short slug stamped into the backup name
    */
-  const writeAndReload = (nextRoutes) => {
-    const backup = readRoutesFromDisk();
+  const writeAndReload = (nextRoutes, reason = 'change') => {
+    const previousFile = readRoutesFromDisk();
+    const settings = settingsStore.get();
+
+    let createdBackup = null;
+    if (settings.backups.mode === 'auto' && fs.existsSync(routingConfigPath)) {
+      try {
+        createdBackup = backupStore.create(reason);
+        backupStore.prune(settings.backups.keep);
+      } catch (err) {
+        log('backup: auto-snapshot failed (non-fatal)', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     atomicWriteRoutes(nextRoutes);
     try {
       reloadRoutingConfig();
     } catch (err) {
-      atomicWriteRoutes(backup);
-      try { reloadRoutingConfig(); } catch { /* backup was already valid in-memory */ }
+      atomicWriteRoutes(previousFile);
+      try { reloadRoutingConfig(); } catch { /* previous was valid */ }
+      if (createdBackup) {
+        try { backupStore.remove(createdBackup.name); } catch { /* ignore */ }
+      }
       throw err;
     }
   };
@@ -214,7 +275,8 @@ const createAdminHandler = ({
 
     if (req.method === 'GET' && pathname === '/admin/routes') {
       const { routes } = getRoutingConfig();
-      return sendJson(res, 200, { routes });
+      const reveal = parseQueryBool(req);
+      return sendJson(res, 200, { routes: routes.map((r) => maskRouteKey(r, { reveal })) });
     }
 
     if (req.method === 'POST' && pathname === '/admin/routes') {
@@ -233,7 +295,7 @@ const createAdminHandler = ({
         return sendJson(res, 409, { error: `route id "${payload.id}" already exists` });
       }
       try {
-        writeAndReload([...current, payload]);
+        writeAndReload([...current, payload], `add_${payload.id}`);
       } catch (err) {
         return sendJson(res, 400, { error: err.message });
       }
@@ -251,7 +313,8 @@ const createAdminHandler = ({
       if (index < 0) return sendJson(res, 404, { error: `route "${routeId}" not found` });
 
       if (!action && req.method === 'GET') {
-        return sendJson(res, 200, { route: current[index] });
+        const reveal = parseQueryBool(req);
+        return sendJson(res, 200, { route: maskRouteKey(current[index], { reveal }) });
       }
 
       if (!action && req.method === 'PUT') {
@@ -266,7 +329,7 @@ const createAdminHandler = ({
         const next = current.slice();
         next[index] = updated;
         try {
-          writeAndReload(next);
+          writeAndReload(next, `edit_${routeId}`);
         } catch (err) {
           return sendJson(res, 400, { error: err.message });
         }
@@ -277,7 +340,7 @@ const createAdminHandler = ({
       if (!action && req.method === 'DELETE') {
         const next = current.filter((_, i) => i !== index);
         try {
-          writeAndReload(next);
+          writeAndReload(next, `delete_${routeId}`);
         } catch (err) {
           return sendJson(res, 400, { error: err.message });
         }
@@ -290,12 +353,81 @@ const createAdminHandler = ({
         const next = current.slice();
         next[index] = { ...current[index], enabled };
         try {
-          writeAndReload(next);
+          writeAndReload(next, `${enabled ? 'enable' : 'disable'}_${routeId}`);
         } catch (err) {
           return sendJson(res, 400, { error: err.message });
         }
         log(`Admin: route ${enabled ? 'enabled' : 'disabled'}`, { route_id: routeId });
         return sendJson(res, 200, { ok: true, route: next[index] });
+      }
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────────
+    if (req.method === 'GET' && pathname === '/admin/settings') {
+      return sendJson(res, 200, { settings: settingsStore.get() });
+    }
+
+    if (req.method === 'PUT' && pathname === '/admin/settings') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        return sendJson(res, err.status || 400, { error: err.message });
+      }
+      try {
+        const updated = settingsStore.update(body);
+        log('Admin: settings updated', { settings: updated });
+        return sendJson(res, 200, { settings: updated });
+      } catch (err) {
+        return sendJson(res, err.status || 400, { error: err.message });
+      }
+    }
+
+    // ── Backups ──────────────────────────────────────────────────────────
+    if (req.method === 'GET' && pathname === '/admin/backups') {
+      return sendJson(res, 200, { backups: backupStore.list() });
+    }
+
+    if (req.method === 'POST' && pathname === '/admin/backups') {
+      let body = {};
+      try { body = await readJsonBody(req); }
+      catch (err) { return sendJson(res, err.status || 400, { error: err.message }); }
+      try {
+        const created = backupStore.create(body.reason || 'manual');
+        backupStore.prune(settingsStore.get().backups.keep);
+        log('Admin: backup created', { name: created.name });
+        return sendJson(res, 201, { backup: created });
+      } catch (err) {
+        return sendJson(res, err.status || 500, { error: err.message });
+      }
+    }
+
+    // /admin/backups/:name(/restore)?
+    const backupMatch = pathname.match(/^\/admin\/backups\/([^/]+)(\/restore)?$/);
+    if (backupMatch) {
+      const rawName = decodeURIComponent(backupMatch[1]);
+      const isRestore = backupMatch[2] === '/restore';
+
+      if (isRestore && req.method === 'POST') {
+        let parsed;
+        try { parsed = backupStore.read(rawName); }
+        catch (err) { return sendJson(res, err.status || 500, { error: err.message }); }
+        try {
+          writeAndReload(parsed.routes, `restore_${rawName}`);
+        } catch (err) {
+          return sendJson(res, 400, { error: err.message });
+        }
+        log('Admin: backup restored', { name: rawName });
+        return sendJson(res, 200, { ok: true, routes_total: parsed.routes.length });
+      }
+
+      if (!isRestore && req.method === 'DELETE') {
+        try {
+          backupStore.remove(rawName);
+          return sendJson(res, 200, { ok: true });
+        } catch (err) {
+          return sendJson(res, err.status || 500, { error: err.message });
+        }
       }
     }
 
