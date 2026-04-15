@@ -125,8 +125,18 @@ const validateRoute = (route, index) => {
   } else if (route.source.network === 'max') {
     ensureNumber(route.source.chat_id, `routes[${id}].source.chat_id`);
   } else if (route.source.network === 'api') {
-    ensureString(route.source.api_key_env, `routes[${id}].source.api_key_env`);
-    assert(process.env[route.source.api_key_env], `routes[${id}].source: env var ${route.source.api_key_env} is not set`);
+    // Accept either an inline key (stored in routes.json) or a reference
+    // to an env var. Inline is simpler for self-service CLI setup; env
+    // var is the "traditional" separation-of-secrets option.
+    const hasInline = typeof route.source.api_key === 'string' && route.source.api_key.length > 0;
+    const hasEnv = typeof route.source.api_key_env === 'string' && route.source.api_key_env.length > 0;
+    assert(hasInline || hasEnv, `routes[${id}].source: set api_key (inline) or api_key_env (env var name)`);
+    if (hasInline) {
+      assert(route.source.api_key.length >= 16, `routes[${id}].source.api_key must be at least 16 characters`);
+    }
+    if (hasEnv) {
+      assert(process.env[route.source.api_key_env], `routes[${id}].source: env var ${route.source.api_key_env} is not set`);
+    }
   } else {
     throw new Error(`routes[${id}].source.network unsupported: ${route.source.network}`);
   }
@@ -1048,7 +1058,8 @@ const findApiRoutes = (apiKey) => {
   if (!apiKey) return [];
   return getEnabledRoutes().filter((route) => {
     if (route.source.network !== 'api') return false;
-    const routeKey = process.env[route.source.api_key_env];
+    // Inline key wins if present, otherwise fall back to env var.
+    const routeKey = route.source.api_key || process.env[route.source.api_key_env];
     if (!routeKey) return false;
     try {
       const a = Buffer.from(apiKey);
@@ -1500,11 +1511,22 @@ const bootstrap = async () => {
     ? maxAllowedUpdates
     : ['message_created', 'message_edited', 'bot_added', 'bot_started', 'message_callback'];
 
-  void maxBot.start({ allowedUpdates }).catch((err) => {
-    log('MAX polling startup error', {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  });
+  const startMaxPolling = async () => {
+    const MAX_POLLING_RESTART_DELAY_MS = 3000;
+    while (true) {
+      try {
+        await maxBot.start({ allowedUpdates });
+        // start() resolved — polling loop exited (SDK bug: returns on transient errors)
+        log('MAX polling loop exited unexpectedly, restarting...');
+      } catch (err) {
+        log('MAX polling error', { error: err instanceof Error ? err.message : String(err) });
+      }
+      maxBot.stop();
+      await sleep(MAX_POLLING_RESTART_DELAY_MS);
+    }
+  };
+
+  void startMaxPolling();
 
   log('MAX listener started', { allowedUpdates });
 
